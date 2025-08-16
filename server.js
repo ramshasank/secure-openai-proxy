@@ -93,8 +93,7 @@ app.post('/classify', verifyJWT, async (req, res) => {
     const user = `Text: "${text}"\nCategories: ${JSON.stringify(categories)}\nSubcategoriesByCategory: ${JSON.stringify(subcategoriesByCat)}`
 
     const body = {
-      model: OPENAI_MODEL,
-      temperature: 0,
+      model: OPENAI_MODEL,              // e.g. 'gpt-5-nano'
       messages: [
         { role: 'system', content: system },
         { role: 'user', content: user }

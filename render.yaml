@@ -2,13 +2,19 @@ services:
   - type: web
     name: secure-openai-proxy
     env: node
+    buildCommand: "npm install"
+    startCommand: "npm start"
     plan: free
-    buildCommand: npm install
-    startCommand: npm start
     envVars:
-      - key: OPENAI_API_KEY
-        sync: false   # set in Render dashboard
       - key: JWT_SECRET
+        sync: false
+      - key: OPENAI_API_KEY
         sync: false
       - key: OPENAI_MODEL
         value: gpt-5-nano
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: GEMINI_MODEL
+        value: gemini-2.5-flash-lite
+      - key: FALLBACK_CONFIDENCE
+        value: "0.6"

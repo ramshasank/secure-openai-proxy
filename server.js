@@ -1,211 +1,297 @@
+// server.js
 import express from "express";
-import cors from "cors";
 import helmet from "helmet";
+import cors from "cors";
 import rateLimit from "express-rate-limit";
-import jwt from "jsonwebtoken";
-import dotenv from "dotenv";
 import fetch from "node-fetch";
 
-dotenv.config();
-
-const {
-  PORT = 3000,
-  NODE_ENV = "development",
-  JWT_SECRET,
-  GEMINI_API_KEY,
-  OPENAI_API_KEY,
-  ALLOW_ORIGINS = "*"
-} = process.env;
-
-if (!JWT_SECRET) {
-  console.warn("[WARN] JWT_SECRET is not set. Set it in Render env vars.");
-}
-
+// ---------- App setup ----------
 const app = express();
-app.use(express.json({ limit: "1mb" }));
 app.use(helmet());
-app.use(cors({ origin: (ALLOW_ORIGINS === "*" ? true : ALLOW_ORIGINS.split(",")) }));
+app.use(cors());
+app.use(express.json({ limit: "512kb" }));
 
-const limiter = rateLimit({
-  windowMs: 60 * 1000,
-  max: 120,
-  standardHeaders: true,
-  legacyHeaders: false,
-});
+const limiter = rateLimit({ windowMs: 60 * 1000, max: 120 });
 app.use(limiter);
 
-// ---- auth helpers ----
-function signToken(deviceId) {
-  const payload = { did: deviceId };
-  return jwt.sign(payload, JWT_SECRET || "dev-secret", { expiresIn: "30m" });
+// ---------- ENV ----------
+const GEMINI_API_KEY = process.env.GEMINI_API_KEY || "";
+const OPENAI_API_KEY = process.env.OPENAI_API_KEY || "";
+const OPENAI_MODEL = process.env.OPENAI_MODEL || "gpt-5-nano";
+const DEBUG_LOG = process.env.DEBUG_LOG === "1";
+const FALLBACK_CONFIDENCE = Number(process.env.FALLBACK_CONFIDENCE || "0.6");
+
+// JWT_* present in your env, but intentionally **unused** (no client token required)
+
+// ---------- Tiny LRU cache ----------
+const LRU_MAX = 5000;
+const CACHE_TTL_MS = 7 * 24 * 3600 * 1000;
+const CACHE = new Map(); // key -> { ts, value }
+
+function cacheKey({ text, categories, subcategoriesByCat }) {
+  return JSON.stringify({
+    t: String(text || "").trim().toLowerCase(),
+    c: (categories || []).map((c) => c.toLowerCase()).sort(),
+    s: Object.fromEntries(
+      Object.entries(subcategoriesByCat || {}).map(([k, v]) => [
+        k.toLowerCase(),
+        (v || []).map((x) => x.toLowerCase()).sort(),
+      ])
+    ),
+  });
+}
+function cacheGet(key) {
+  const hit = CACHE.get(key);
+  if (!hit) return null;
+  if (Date.now() - hit.ts > CACHE_TTL_MS) {
+    CACHE.delete(key);
+    return null;
+  }
+  return hit.value;
+}
+function cacheSet(key, value) {
+  if (CACHE.size > LRU_MAX) {
+    const first = CACHE.keys().next().value;
+    if (first) CACHE.delete(first);
+  }
+  CACHE.set(key, { ts: Date.now(), value });
 }
 
-function auth(req, res, next) {
-  const authz = req.headers.authorization || "";
-  const token = authz.startsWith("Bearer ") ? authz.slice(7) : null;
-  if (!token) return res.status(401).json({ error: "Missing token" });
+// ---------- Helpers ----------
+function clamp(x, lo, hi) { return Math.max(lo, Math.min(hi, x)); }
+
+function pickProvidedCategory(modelOut, provided) {
+  if (!modelOut || !provided?.length) return null;
+  const m = String(modelOut).toLowerCase();
+  for (const p of provided) {
+    if (String(p).toLowerCase() === m) return p; // use provided casing
+  }
+  return null;
+}
+
+function validateSub(category, sub, subsByCat) {
+  if (!sub || !category) return null;
+  const list = subsByCat?.[category] || [];
+  return list.find((s) => s.toLowerCase() === String(sub).toLowerCase()) || null;
+}
+
+const CLASSIFIER_INSTRUCTION = `
+You are a short-text classifier. Return ONLY valid JSON:
+{"category": string, "subcategory": string|null, "confidence": number (0..1), "reason": string, "suggestedNewCategory": string|null}
+
+DECISION RULES (apply in order):
+1) If the text is a TV series, season, or episode title → category "Shows".
+2) If the text is a film/movie title → category "Movies".
+3) If the text is an ACTION without time/date (buy, watch, call, renew, subscribe, order) → "To-do".
+4) If the text includes a time or a date (e.g., "4:30", "tomorrow", "Friday", "next week") → "Reminders".
+5) If the text is a food/ingredient/grocery item → "Groceries".
+6) If none of the above fit → "Other".
+
+IMPORTANT:
+- Prefer "Reminders" ONLY when there is explicit time/date; do NOT place media titles or ingredients in "Reminders".
+- "Groceries" is ONLY for foods/ingredients or household consumables (cilantro, green chillies, eggs, detergent), not generic words like "friends".
+- "subcategory" must be one from subcategoriesByCat[category] if appropriate (case-insensitive); otherwise null.
+- Output category must match one of the provided categories exactly (case-insensitive match to pick, but output must use provided casing).
+- If a clearly better category is missing (e.g., "Tennis" → "Sports"), set "suggestedNewCategory" to that single word; else null.
+
+FEW-SHOTS:
+- "How I Met Your Mother" → {"category":"Shows","subcategory":null}
+- "Friends" → {"category":"Shows","subcategory":null}
+- "Rocky" → {"category":"Movies","subcategory":null}
+- "Rambo" → {"category":"Movies","subcategory":null}
+- "green chillies" → {"category":"Groceries","subcategory":null}
+- "cilantro 2" → {"category":"Groceries","subcategory":null}
+- "pick up Rishi at 4:30" → {"category":"Reminders","subcategory":null}
+- "watch Chinese drama" → {"category":"To-do","subcategory":null}
+- "Chinese drama subscription" → {"category":"To-do","subcategory":null}
+`;
+
+// ---------- Gemini ----------
+async function classifyWithGemini({ text, categories, subcategoriesByCat }) {
+  if (!GEMINI_API_KEY) throw new Error("Missing GEMINI_API_KEY");
+
+  const url =
+    "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-lite:generateContent?key=" +
+    GEMINI_API_KEY;
+
+  const cats = Array.isArray(categories) ? categories : [];
+  const subs = subcategoriesByCat && typeof subcategoriesByCat === "object" ? subcategoriesByCat : {};
+
+  const userText =
+    CLASSIFIER_INSTRUCTION +
+    "\n\nCATEGORIES:\n" +
+    JSON.stringify(cats) +
+    "\n\nSUBCATEGORIES_BY_CATEGORY:\n" +
+    JSON.stringify(subs) +
+    "\n\nTEXT:\n" +
+    text;
+
+  const payload = {
+    contents: [{ role: "user", parts: [{ text: userText }] }],
+    generationConfig: { response_mime_type: "application/json" },
+  };
+
+  const ac = new AbortController();
+  const to = setTimeout(() => ac.abort(), 8000); // 8s guard
   try {
-    const dec = jwt.verify(token, JWT_SECRET || "dev-secret");
-    req.user = dec;
-    next();
-  } catch (err) {
-    return res.status(401).json({ error: "Invalid token" });
+    const r = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+      signal: ac.signal,
+    });
+    const j = await r.json();
+    const textOut = j?.candidates?.[0]?.content?.parts?.[0]?.text?.trim();
+    const out = JSON.parse(textOut || "{}");
+
+    const picked = pickProvidedCategory(out.category, cats);
+    return {
+      provider: "gemini",
+      category: picked ?? "Other",
+      subcategory: validateSub(picked ?? "Other", out.subcategory, subs),
+      confidence: clamp(out.confidence ?? FALLBACK_CONFIDENCE, 0, 1),
+      reason: out.reason || "",
+      suggestedNewCategory: out.suggestedNewCategory || null,
+    };
+  } finally {
+    clearTimeout(to);
   }
 }
 
-// ---- routes ----
-app.get("/health", (_req, res) => {
-  res.json({ ok: true, provider: (GEMINI_API_KEY ? "gemini" : (OPENAI_API_KEY ? "openai" : "none")) });
-});
+// ---------- OpenAI fallback ----------
+async function classifyWithOpenAI({ text, categories, subcategoriesByCat }) {
+  if (!OPENAI_API_KEY) throw new Error("Missing OPENAI_API_KEY");
 
-app.post("/session", (req, res) => {
-  const { deviceId } = req.body || {};
-  if (!deviceId) return res.status(400).json({ error: "deviceId required" });
-  const token = signToken(deviceId);
-  res.json({ token, expiresInSec: 30 * 60 });
-});
+  const url = "https://api.openai.com/v1/chat/completions";
+  const cats = Array.isArray(categories) ? categories : [];
+  const subs = subcategoriesByCat && typeof subcategoriesByCat === "object" ? subcategoriesByCat : {};
 
-// Core classify (single)
-app.post("/classify", auth, async (req, res) => {
+  const userText =
+    CLASSIFIER_INSTRUCTION +
+    "\n\nCATEGORIES:\n" +
+    JSON.stringify(cats) +
+    "\n\nSUBCATEGORIES_BY_CATEGORY:\n" +
+    JSON.stringify(subs) +
+    "\n\nTEXT:\n" +
+    text;
+
+  const payload = {
+    model: OPENAI_MODEL,
+    messages: [
+      { role: "system", content: "You are a JSON-only classifier. Output valid JSON object only." },
+      { role: "user", content: userText }
+    ],
+    response_format: { type: "json_object" } // JSON mode
+    // NOTE: do not set temperature; some small models only accept default
+  };
+
+  const ac = new AbortController();
+  const to = setTimeout(() => ac.abort(), 8000);
   try {
-    const { text, categories, subcategoriesByCat, provider = "gemini" } = req.body || {};
-    if (!text || !Array.isArray(categories)) return res.status(400).json({ error: "text and categories required" });
+    const r = await fetch(url, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Authorization": `Bearer ${OPENAI_API_KEY}`
+      },
+      body: JSON.stringify(payload),
+      signal: ac.signal,
+    });
+    const j = await r.json();
+    const textOut = j?.choices?.[0]?.message?.content?.trim();
+    const out = JSON.parse(textOut || "{}");
 
-    const result = await routeClassify({ text, categories, subcategoriesByCat, provider });
-    res.json(result);
+    const picked = pickProvidedCategory(out.category, cats);
+    return {
+      provider: "openai",
+      category: picked ?? "Other",
+      subcategory: validateSub(picked ?? "Other", out.subcategory, subs),
+      confidence: clamp(out.confidence ?? FALLBACK_CONFIDENCE, 0, 1),
+      reason: out.reason || "",
+      suggestedNewCategory: out.suggestedNewCategory || null,
+    };
+  } finally {
+    clearTimeout(to);
+  }
+}
+
+// ---------- Router with fallback logic ----------
+async function routeClassify({ text, categories, subcategoriesByCat }) {
+  // Primary: Gemini
+  if (GEMINI_API_KEY) {
+    try {
+      return await classifyWithGemini({ text, categories, subcategoriesByCat });
+    } catch (e) {
+      if (DEBUG_LOG) console.warn("[route] Gemini failed, falling back to OpenAI:", String(e));
+    }
+  }
+  // Fallback: OpenAI
+  if (OPENAI_API_KEY) {
+    return await classifyWithOpenAI({ text, categories, subcategoriesByCat });
+  }
+  throw new Error("No provider configured (set GEMINI_API_KEY or OPENAI_API_KEY)");
+}
+
+// ---------- Endpoints ----------
+app.get("/health", (_req, res) => {
+  res.json({
+    ok: true,
+    primary: GEMINI_API_KEY ? "gemini" : (OPENAI_API_KEY ? "openai" : "none"),
+    fallback: OPENAI_API_KEY ? "openai" : "none",
+    cacheSize: CACHE.size
+  });
+});
+
+app.post("/classify", async (req, res) => {
+  const t0 = Date.now();
+  try {
+    const { text, categories, subcategoriesByCat } = req.body || {};
+    if (!text || !Array.isArray(categories)) {
+      return res.status(400).json({ error: "text and categories required" });
+    }
+    const key = cacheKey({ text, categories, subcategoriesByCat });
+    const cached = cacheGet(key);
+    if (cached) return res.json({ ...cached, cached: true, ms: 0 });
+
+    if (DEBUG_LOG) console.log(`[classify] start text="${String(text).slice(0, 80)}"`);
+    const out = await routeClassify({ text, categories, subcategoriesByCat });
+    cacheSet(key, out);
+    const ms = Date.now() - t0;
+    if (DEBUG_LOG) console.log(`[classify] done ${ms}ms via ${out.provider} -> ${out.category}/${out.subcategory ?? "—"} conf=${out.confidence}`);
+    res.json({ ...out, cached: false, ms });
   } catch (e) {
-    console.error("[/classify] error", e);
+    console.error("[classify] error", e);
     res.status(502).json({ error: "Upstream error", detail: String(e) });
   }
 });
 
-// Batch classify
-app.post("/classify-batch", auth, async (req, res) => {
+app.post("/classify-batch", async (req, res) => {
+  const t0 = Date.now();
   try {
-    const { items, categories, subcategoriesByCat, provider = "gemini" } = req.body || {};
+    const { items, categories, subcategoriesByCat } = req.body || {};
     if (!Array.isArray(items) || !Array.isArray(categories)) {
       return res.status(400).json({ error: "items[] and categories[] required" });
     }
-    const results = await Promise.all(items.map(text => routeClassify({ text, categories, subcategoriesByCat, provider })));
-    res.json({ results });
+    if (DEBUG_LOG) console.log(`[batch] start n=${items.length}`);
+    const results = await Promise.all(
+      items.map(async (text) => {
+        const key = cacheKey({ text, categories, subcategoriesByCat });
+        const cached = cacheGet(key);
+        if (cached) return { ...cached, cached: true, ms: 0 };
+        const out = await routeClassify({ text, categories, subcategoriesByCat });
+        cacheSet(key, out);
+        return { ...out, cached: false, ms: 0 };
+      })
+    );
+    const ms = Date.now() - t0;
+    if (DEBUG_LOG) console.log(`[batch] done ${ms}ms`);
+    res.json({ results, ms });
   } catch (e) {
-    console.error("[/classify-batch] error", e);
+    console.error("[batch] error", e);
     res.status(502).json({ error: "Upstream error", detail: String(e) });
   }
 });
 
-// ---- router ----
-async function routeClassify({ text, categories, subcategoriesByCat, provider }) {
-  if (provider === "gemini") {
-    if (!GEMINI_API_KEY) throw new Error("Missing GEMINI_API_KEY");
-    return await classifyWithGemini(text, categories, subcategoriesByCat);
-  } else {
-    if (!OPENAI_API_KEY) throw new Error("Missing OPENAI_API_KEY");
-    return await classifyWithOpenAI(text, categories, subcategoriesByCat);
-  }
-}
-
-// ---- Gemini ----
-async function classifyWithGemini(text, categories, subcats) {
-  const model = "gemini-2.5-flash-lite";
-  const sys = `You are a categorizer. Only respond with strict JSON.
-Return:
-{
-  "category": "<one of categories array, or a new suggestion>",
-  "subcategory": "<optional string or null>",
-  "confidence": <0..1 number>,
-  "teach": {
-    "positiveTokens": ["optional", "keywords"],
-    "negativeTokens": ["optional", "keywords"],
-    "patterns": ["optional regex or phrase hints"]
-  }
-}`;
-  const prompt = {
-    role: "user",
-    parts: [{
-      text:
-`SYSTEM:
-${sys}
-
-CATEGORIES: ${JSON.stringify(categories)}
-SUBCATS: ${JSON.stringify(subcats || {})}
-
-TEXT: ${text}
-
-Rules:
-- If none fits well, propose a new category name (short, singular), but still pick the best among current categories as the 'category' value if you must. Use confidence to reflect uncertainty.
-- If a subcategory is obvious (e.g., store name for groceries), include it.
-- Keep JSON valid. No extra commentary.`
-    }]
-  };
-
-  const body = {
-    contents: [prompt],
-    generationConfig: { temperature: 0.4, responseMimeType: "application/json" }
-  };
-
-  const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${encodeURIComponent(GEMINI_API_KEY)}`;
-  const r = await fetch(url, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(body)
-  });
-  if (!r.ok) {
-    const textErr = await r.text();
-    throw new Error(`Gemini ${r.status}: ${textErr}`);
-  }
-  const data = await r.json();
-  const raw = data?.candidates?.[0]?.content?.parts?.[0]?.text || "{}";
-  // Best-effort parse
-  let parsed;
-  try { parsed = JSON.parse(raw); } catch {
-    parsed = { category: "Other", subcategory: null, confidence: 0.5 };
-  }
-  // Normalize
-  return {
-    category: parsed.category || "Other",
-    subcategory: (parsed.subcategory === "" ? null : parsed.subcategory) ?? null,
-    confidence: typeof parsed.confidence === "number" ? parsed.confidence : 0.6,
-    teach: parsed.teach || { positiveTokens: [], negativeTokens: [], patterns: [] }
-  };
-}
-
-// ---- OpenAI fallback (optional) ----
-async function classifyWithOpenAI(text, categories, subcats) {
-  const url = "https://api.openai.com/v1/chat/completions";
-  const system = `You are a categorizer. Reply in JSON: {"category":"","subcategory":null,"confidence":0.0,"teach":{"positiveTokens":[],"negativeTokens":[],"patterns":[]}}`;
-  const messages = [
-    { role: "system", content: system },
-    { role: "user", content: `Categories: ${JSON.stringify(categories)}; Subcats: ${JSON.stringify(subcats||{})}; Text: ${text}` }
-  ];
-  const body = {
-    model: "gpt-5-mini",
-    temperature: 0.4,
-    messages
-  };
-  const r = await fetch(url, {
-    method: "POST",
-    headers: { "Content-Type": "application/json", "Authorization": `Bearer ${process.env.OPENAI_API_KEY}` },
-    body: JSON.stringify(body)
-  });
-  if (!r.ok) {
-    const err = await r.text();
-    throw new Error(`OpenAI ${r.status}: ${err}`);
-  }
-  const data = await r.json();
-  const textOut = data?.choices?.[0]?.message?.content || "{}";
-  let parsed;
-  try { parsed = JSON.parse(textOut); } catch {
-    parsed = { category: "Other", subcategory: null, confidence: 0.5, teach: {positiveTokens:[],negativeTokens:[],patterns:[]} };
-  }
-  return {
-    category: parsed.category || "Other",
-    subcategory: (parsed.subcategory === "" ? null : parsed.subcategory) ?? null,
-    confidence: typeof parsed.confidence === "number" ? parsed.confidence : 0.6,
-    teach: parsed.teach || { positiveTokens: [], negativeTokens: [], patterns: [] }
-  };
-}
-
-app.listen(PORT, () => {
-  console.log(`[proxy] listening on ${PORT} (${NODE_ENV})`);
-});
+// ---------- Start ----------
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => console.log("proxy up on :" + PORT));

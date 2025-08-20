@@ -17,11 +17,9 @@ app.use(limiter);
 // ---------- ENV ----------
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY || "";
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY || "";
-const OPENAI_MODEL = process.env.OPENAI_MODEL || "gpt-5-nano";
-const DEBUG_LOG = process.env.DEBUG_LOG === "1";
+const OPENAI_MODEL   = process.env.OPENAI_MODEL || "gpt-5-nano";
+const DEBUG_LOG      = process.env.DEBUG_LOG === "1";
 const FALLBACK_CONFIDENCE = Number(process.env.FALLBACK_CONFIDENCE || "0.6");
-
-// JWT_* present in your env, but intentionally **unused** (no client token required)
 
 // ---------- Tiny LRU cache ----------
 const LRU_MAX = 5000;
@@ -64,7 +62,7 @@ function pickProvidedCategory(modelOut, provided) {
   if (!modelOut || !provided?.length) return null;
   const m = String(modelOut).toLowerCase();
   for (const p of provided) {
-    if (String(p).toLowerCase() === m) return p; // use provided casing
+    if (String(p).toLowerCase() === m) return p; // keep provided casing
   }
   return null;
 }
@@ -75,38 +73,40 @@ function validateSub(category, sub, subsByCat) {
   return list.find((s) => s.toLowerCase() === String(sub).toLowerCase()) || null;
 }
 
+// ---------- Classifier instruction (rules-only, no user-specific examples) ----------
 const CLASSIFIER_INSTRUCTION = `
-You are a short-text classifier. Return ONLY valid JSON:
-{"category": string, "subcategory": string|null, "confidence": number (0..1), "reason": string, "suggestedNewCategory": string|null}
+You classify a short user note into exactly ONE of the provided categories.
 
-DECISION RULES (apply in order):
-1) If the text is a TV series, season, or episode title → category "Shows".
-2) If the text is a film/movie title → category "Movies".
-3) If the text is an ACTION without time/date (buy, watch, call, renew, subscribe, order) → "To-do".
-4) If the text includes a time or a date (e.g., "4:30", "tomorrow", "Friday", "next week") → "Reminders".
-5) If the text is a food/ingredient/grocery item → "Groceries".
-6) If none of the above fit → "Other".
+CATEGORIES (intended meaning)
+- Reminders: explicit time/date present (“at 4:30”, “tomorrow”, weekdays, ISO times).
+- To-do: task phrasing (buy, pick up, call, schedule, renew, subscribe) with NO explicit time.
+- Groceries: food/ingredients/edibles or common household consumables (eggs, sugar, cilantro, detergent).
+- Movies: film-related with media signals (movie/film/trailer/watch + title/year/actor/director).
+- Shows: TV/series/anime/cartoon with signals (show/series/episode/season).
+- Other: everything else.
 
-IMPORTANT:
-- Prefer "Reminders" ONLY when there is explicit time/date; do NOT place media titles or ingredients in "Reminders".
-- "Groceries" is ONLY for foods/ingredients or household consumables (cilantro, green chillies, eggs, detergent), not generic words like "friends".
-- "subcategory" must be one from subcategoriesByCat[category] if appropriate (case-insensitive); otherwise null.
-- Output category must match one of the provided categories exactly (case-insensitive match to pick, but output must use provided casing).
-- If a clearly better category is missing (e.g., "Tennis" → "Sports"), set "suggestedNewCategory" to that single word; else null.
+AMBIGUITY POLICY (CRITICAL)
+If the text is short and could be multiple things (e.g., a single proper noun with no context),
+do NOT guess. Use "category":"Other" AND set "suggestedNewCategory" to a concise type (e.g., "Sports", "Cars", "Books", "Shopping") inferred from general knowledge.
 
-FEW-SHOTS:
-- "How I Met Your Mother" → {"category":"Shows","subcategory":null}
-- "Friends" → {"category":"Shows","subcategory":null}
-- "Rocky" → {"category":"Movies","subcategory":null}
-- "Rambo" → {"category":"Movies","subcategory":null}
-- "green chillies" → {"category":"Groceries","subcategory":null}
-- "cilantro 2" → {"category":"Groceries","subcategory":null}
-- "pick up Rishi at 4:30" → {"category":"Reminders","subcategory":null}
-- "watch Chinese drama" → {"category":"To-do","subcategory":null}
-- "Chinese drama subscription" → {"category":"To-do","subcategory":null}
+SUBCATEGORIES
+Return a subcategory ONLY if it exists in the provided mapping for the chosen category; else null.
+
+CONFIDENCE
+Return a value 0..1. Penalize short/ambiguous inputs; increase only when explicit signals exist.
+
+OUTPUT
+Return STRICT JSON (no prose, no markdown):
+{
+  "category": string,             // must be one of the provided categories
+  "subcategory": string|null,     // must be from subcategoriesByCat[category] or null
+  "confidence": number,           // 0..1
+  "reason": string,
+  "suggestedNewCategory": string|null
+}
 `;
 
-// ---------- Gemini ----------
+// ---------- Gemini primary ----------
 async function classifyWithGemini({ text, categories, subcategoriesByCat }) {
   if (!GEMINI_API_KEY) throw new Error("Missing GEMINI_API_KEY");
 
@@ -117,14 +117,22 @@ async function classifyWithGemini({ text, categories, subcategoriesByCat }) {
   const cats = Array.isArray(categories) ? categories : [];
   const subs = subcategoriesByCat && typeof subcategoriesByCat === "object" ? subcategoriesByCat : {};
 
+  // Ambiguity nudge for short proper nouns with no obvious signals
+  const trimmed = String(text || "").trim();
+  const isShort  = trimmed.split(/\s+/).length <= 2;
+  const looksProper = /^[A-Z][a-z]+$/.test(trimmed);
+  const hasSignals = /\b(movie|film|show|series|episode|season|watch|buy|order|call|email|tomorrow|today|monday|tuesday|wednesday|thursday|friday|saturday|sunday|\d{1,2}:\d{2}|am|pm|kg|g|oz|lb|lbs|dozen)\b/i.test(trimmed);
+
+  const ambiguityHint = (isShort && looksProper && !hasSignals)
+    ? "The input looks like a short proper noun without clear signals. Do not guess; use category 'Other' and propose a concise suggestedNewCategory if a generic type is obvious (e.g., Sports, Cars, Books)."
+    : "";
+
   const userText =
     CLASSIFIER_INSTRUCTION +
-    "\n\nCATEGORIES:\n" +
-    JSON.stringify(cats) +
-    "\n\nSUBCATEGORIES_BY_CATEGORY:\n" +
-    JSON.stringify(subs) +
-    "\n\nTEXT:\n" +
-    text;
+    (ambiguityHint ? ("\n\nAMBIGUITY HINT:\n" + ambiguityHint) : "") +
+    "\n\nPROVIDED CATEGORIES:\n" + JSON.stringify(cats) +
+    "\n\nSUBCATEGORIES_BY_CATEGORY:\n" + JSON.stringify(subs) +
+    "\n\nTEXT:\n" + text;
 
   const payload = {
     contents: [{ role: "user", parts: [{ text: userText }] }],
@@ -168,12 +176,9 @@ async function classifyWithOpenAI({ text, categories, subcategoriesByCat }) {
 
   const userText =
     CLASSIFIER_INSTRUCTION +
-    "\n\nCATEGORIES:\n" +
-    JSON.stringify(cats) +
-    "\n\nSUBCATEGORIES_BY_CATEGORY:\n" +
-    JSON.stringify(subs) +
-    "\n\nTEXT:\n" +
-    text;
+    "\n\nPROVIDED CATEGORIES:\n" + JSON.stringify(cats) +
+    "\n\nSUBCATEGORIES_BY_CATEGORY:\n" + JSON.stringify(subs) +
+    "\n\nTEXT:\n" + text;
 
   const payload = {
     model: OPENAI_MODEL,
@@ -181,8 +186,7 @@ async function classifyWithOpenAI({ text, categories, subcategoriesByCat }) {
       { role: "system", content: "You are a JSON-only classifier. Output valid JSON object only." },
       { role: "user", content: userText }
     ],
-    response_format: { type: "json_object" } // JSON mode
-    // NOTE: do not set temperature; some small models only accept default
+    response_format: { type: "json_object" }
   };
 
   const ac = new AbortController();

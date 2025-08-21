@@ -10,6 +10,7 @@ const app = express();
 app.use(helmet());
 app.use(cors());
 app.use(express.json({ limit: "512kb" }));
+app.set("trust proxy", 1);
 
 const limiter = rateLimit({ windowMs: 60 * 1000, max: 120 });
 app.use(limiter);

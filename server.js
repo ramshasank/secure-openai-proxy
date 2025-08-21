@@ -299,36 +299,33 @@ app.post("/classify-batch", async (req, res) => {
 
 // --- Add this new route BEFORE app.listen(...) ---
 
+// ---- ADD/REPLACE: /analyze (per-line only, no overall) ----
 app.post("/analyze", async (req, res) => {
-  const t0 = Date.now();
   try {
     const { text, categories, subcategoriesByCat, hintsByCategory } = req.body || {};
     if (typeof text !== "string" || !Array.isArray(categories)) {
       return res.status(400).json({ error: "text and categories required" });
     }
 
-    // A single instruction that asks the model to:
-    // 1) split by line, 2) classify each line into provided categories,
-    // 3) propose suggestedNewCategory if missing, 4) compute overallCategory if ≥80% agree.
     const INSTR = `
-Return ONLY JSON. Schema:
+Return ONLY JSON with this exact shape:
 {
-  "overallCategory": string|null,
-  "confidence": number|null,
-  "suggestedNewCategory": string|null,
   "items": [
-    { "text": string, "category": string, "subcategory": string|null, "confidence": number, "suggestedNewCategory": string|null }
+    { "text": string, "category": string, "subcategory": string|null,
+      "confidence": number, "suggestedNewCategory": string|null }
   ],
   "reason": string|null
 }
 
 Rules:
-- "category" MUST be one of the provided CATEGORIES (case-insensitive, but output must match provided casing), otherwise use "Other".
-- If a clearly better category is missing, set "suggestedNewCategory" to a single word (e.g., "Sports", "App feedback").
-- Choose "overallCategory" only if ≥80% of lines fit that category (even if it's a new suggested one).
-- If "overallCategory" is not one of the provided categories, still set it (the client may create it).
-- Prefer "Reminders" only with explicit time/date. Action verbs ("buy","watch","renew","call", etc.) bias "To-do".
-- Use HINTS_BY_CATEGORY (user-specific phrases) only to disambiguate, not to invent labels.
+- Split the TEXT by lines; ignore empty lines and "- [ ]" or "- " prefixes.
+- For each line, pick "category" from the provided CATEGORIES (case-insensitive, output casing must match provided).
+- If no provided category fits, set category to "Other" and, if a clearly better missing category exists, set "suggestedNewCategory" to ONE word (e.g., "Sports", "App feedback").
+- Prefer "Reminders" ONLY when the line contains a concrete time/date.
+- Action verbs ("buy","watch","renew","call","order","pick up", etc.) bias "To-do" unless an explicit date/time makes it a "Reminders".
+- Subcategory must be drawn from SUBCATEGORIES_BY_CATEGORY[category] if appropriate; otherwise null.
+- Use HINTS_BY_CATEGORY only to disambiguate; do not invent categories not suggested by the line.
+- Do not include any field other than items[] and reason.
 
 CATEGORIES:
 ${JSON.stringify(categories)}
@@ -343,23 +340,20 @@ TEXT:
 ${text}
     `.trim();
 
-    // Call provider in JSON mode (don’t reuse /classify; we want raw JSON from the model)
+    // Prefer Gemini; fallback to OpenAI
     const out = await (async () => {
       if (GEMINI_API_KEY) {
         const url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-lite:generateContent?key=" + GEMINI_API_KEY;
         const payload = {
           contents: [{ role: "user", parts: [{ text: INSTR }] }],
-          generationConfig: { response_mime_type: "application/json", maxOutputTokens: 600 },
+          generationConfig: { response_mime_type: "application/json", maxOutputTokens: 600 }
         };
-        const r = await fetch(url, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(payload),
-        });
+        const r = await fetch(url, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload) });
         const j = await r.json();
         const textOut = j?.candidates?.[0]?.content?.parts?.[0]?.text?.trim() || "{}";
         return JSON.parse(textOut);
-      } else if (OPENAI_API_KEY) {
+      }
+      if (OPENAI_API_KEY) {
         const url = "https://api.openai.com/v1/chat/completions";
         const payload = {
           model: OPENAI_MODEL,
@@ -371,11 +365,8 @@ ${text}
         };
         const r = await fetch(url, {
           method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-            "Authorization": `Bearer ${OPENAI_API_KEY}`
-          },
-          body: JSON.stringify(payload),
+          headers: { "Content-Type": "application/json", "Authorization": `Bearer ${OPENAI_API_KEY}` },
+          body: JSON.stringify(payload)
         });
         const j = await r.json();
         const textOut = j?.choices?.[0]?.message?.content?.trim() || "{}";
@@ -384,12 +375,8 @@ ${text}
       throw new Error("No provider configured");
     })();
 
-    // Normalize shape
     const items = Array.isArray(out.items) ? out.items : [];
     const resp = {
-      overallCategory: out.overallCategory ?? null,
-      confidence: typeof out.confidence === "number" ? out.confidence : null,
-      suggestedNewCategory: out.suggestedNewCategory ?? null,
       items: items.map(it => ({
         text: String(it.text || ""),
         category: String(it.category || "Other"),
@@ -397,8 +384,7 @@ ${text}
         confidence: typeof it.confidence === "number" ? it.confidence : 0.6,
         suggestedNewCategory: it.suggestedNewCategory ?? null
       })),
-      reason: out.reason ?? null,
-      ms: Date.now() - t0
+      reason: out.reason ?? null
     };
 
     res.json(resp);

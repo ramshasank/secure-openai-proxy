@@ -296,152 +296,117 @@ app.post("/classify-batch", async (req, res) => {
   }
 });
 
-// ---------- Start ----------
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log("proxy up on :" + PORT));
-
+// --- Add this new route BEFORE app.listen(...) ---
 
 app.post("/analyze", async (req, res) => {
   const t0 = Date.now();
   try {
     const { text, categories, subcategoriesByCat, hintsByCategory } = req.body || {};
-    if (!text || !Array.isArray(categories)) {
+    if (typeof text !== "string" || !Array.isArray(categories)) {
       return res.status(400).json({ error: "text and categories required" });
     }
 
-    const lines = String(text).split(/\r?\n/).map(s => s.trim()).filter(Boolean);
-    if (!lines.length) {
-      return res.status(400).json({ error: "no lines" });
-    }
-
-    const userText =
-`You are a JSON-only analyzer. Output a single JSON object:
+    // A single instruction that asks the model to:
+    // 1) split by line, 2) classify each line into provided categories,
+    // 3) propose suggestedNewCategory if missing, 4) compute overallCategory if ≥80% agree.
+    const INSTR = `
+Return ONLY JSON. Schema:
 {
   "overallCategory": string|null,
   "confidence": number|null,
   "suggestedNewCategory": string|null,
-  "items": [{"text": string, "category": string, "subcategory": string|null, "confidence": number, "suggestedNewCategory": string|null}, ...],
-  "reason": string
+  "items": [
+    { "text": string, "category": string, "subcategory": string|null, "confidence": number, "suggestedNewCategory": string|null }
+  ],
+  "reason": string|null
 }
 
-CATEGORIES (user-supplied; pick from these, case-insensitive but return with provided casing):
+Rules:
+- "category" MUST be one of the provided CATEGORIES (case-insensitive, but output must match provided casing), otherwise use "Other".
+- If a clearly better category is missing, set "suggestedNewCategory" to a single word (e.g., "Sports", "App feedback").
+- Choose "overallCategory" only if ≥80% of lines fit that category (even if it's a new suggested one).
+- If "overallCategory" is not one of the provided categories, still set it (the client may create it).
+- Prefer "Reminders" only with explicit time/date. Action verbs ("buy","watch","renew","call", etc.) bias "To-do".
+- Use HINTS_BY_CATEGORY (user-specific phrases) only to disambiguate, not to invent labels.
+
+CATEGORIES:
 ${JSON.stringify(categories)}
 
 SUBCATEGORIES_BY_CATEGORY:
 ${JSON.stringify(subcategoriesByCat || {})}
 
-HINTS_BY_CATEGORY (user-specific seeds; optional):
+HINTS_BY_CATEGORY:
 ${JSON.stringify(hintsByCategory || {})}
 
-TASK:
-- Split the input into lines (given separately below).
-- Classify each line into one of CATEGORIES.
-- If a clearly better missing category exists for a line, set item.suggestedNewCategory to that single word; else null.
-- If ≥80% of lines belong to the same category (even if missing), set overallCategory to that category and confidence ~0.8-0.95.
-- If overallCategory is missing from CATEGORIES, set suggestedNewCategory to that word; otherwise keep suggestedNewCategory null.
-- Only set "Reminders" if explicit time/date is present (e.g., '4:30', 'tomorrow', 'Fri', 'next week').
-- Use general world knowledge (ingredients → Groceries, lipstick → Shopping/Beauty, Ferrari → Cars, tennis → Sports, etc.)
-- Be conservative: if unsure, use "Other" and suggest a new category.
+TEXT:
+${text}
+    `.trim();
 
-LINES:
-${JSON.stringify(lines, null, 2)}
-`;
-
-    const preferGemini = !!GEMINI_API_KEY;
-    const call = async (provider) => {
-      if (provider === "gemini") {
+    // Call provider in JSON mode (don’t reuse /classify; we want raw JSON from the model)
+    const out = await (async () => {
+      if (GEMINI_API_KEY) {
         const url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-lite:generateContent?key=" + GEMINI_API_KEY;
         const payload = {
-          contents: [{ role: "user", parts: [{ text: userText }] }],
-          generationConfig: { response_mime_type: "application/json" }
+          contents: [{ role: "user", parts: [{ text: INSTR }] }],
+          generationConfig: { response_mime_type: "application/json", maxOutputTokens: 600 },
         };
-        const r = await fetch(url, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload) });
+        const r = await fetch(url, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(payload),
+        });
         const j = await r.json();
-        const textOut = j?.candidates?.[0]?.content?.parts?.[0]?.text?.trim();
-        return JSON.parse(textOut || "{}");
-      } else {
+        const textOut = j?.candidates?.[0]?.content?.parts?.[0]?.text?.trim() || "{}";
+        return JSON.parse(textOut);
+      } else if (OPENAI_API_KEY) {
         const url = "https://api.openai.com/v1/chat/completions";
         const payload = {
           model: OPENAI_MODEL,
           messages: [
-            { role: "system", content: "You are a JSON-only analyzer." },
-            { role: "user", content: userText }
+            { role: "system", content: "Return JSON only." },
+            { role: "user", content: INSTR }
           ],
           response_format: { type: "json_object" }
         };
-        const r = await fetch(url, { method: "POST", headers: {
-          "Content-Type": "application/json", "Authorization": `Bearer ${OPENAI_API_KEY}`
-        }, body: JSON.stringify(payload) });
+        const r = await fetch(url, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "Authorization": `Bearer ${OPENAI_API_KEY}`
+          },
+          body: JSON.stringify(payload),
+        });
         const j = await r.json();
-        const textOut = j?.choices?.[0]?.message?.content?.trim();
-        return JSON.parse(textOut || "{}");
+        const textOut = j?.choices?.[0]?.message?.content?.trim() || "{}";
+        return JSON.parse(textOut);
       }
-    };
-
-    let out;
-    try {
-      if (!preferGemini) throw new Error("no gemini");
-      out = await call("gemini");
-    } catch {
-      if (!OPENAI_API_KEY) throw new Error("no provider");
-      out = await call("openai");
-    }
-
-    // Post-process: ensure categories are from the provided list, and subcategory is valid.
-    const cats = categories;
-    const subs = subcategoriesByCat || {};
-
-    function pickProvidedCategory(maybe) {
-      if (!maybe) return "Other";
-      const m = String(maybe).toLowerCase();
-      for (const p of cats) { if (String(p).toLowerCase() === m) return p; }
-      return "Other";
-    }
-    function validateSub(cat, sub) {
-      if (!sub) return null;
-      const list = subs[cat] || [];
-      const found = list.find(s => s.toLowerCase() === String(sub).toLowerCase());
-      return found || null;
-    }
-
-    const items = (out.items || []).map(it => {
-      const c = pickProvidedCategory(it.category);
-      return {
-        text: it.text || "",
-        category: c,
-        subcategory: validateSub(c, it.subcategory),
-        confidence: Math.max(0, Math.min(1, Number(it.confidence ?? 0.6))),
-        suggestedNewCategory: it.suggestedNewCategory || null
-      };
-    });
-
-    const majority = (() => {
-      const tally = {};
-      for (const it of items) tally[it.category] = (tally[it.category] || 0) + 1;
-      let bestC = null, bestN = 0;
-      for (const [k, v] of Object.entries(tally)) { if (v > bestN) { bestN = v; bestC = k; } }
-      if (!bestC) return null;
-      if (bestN / Math.max(1, items.length) >= 0.8) return bestC; // 80%
-      return null;
+      throw new Error("No provider configured");
     })();
 
-    const overall = out.overallCategory || majority;
-    const overallPicked = overall ? pickProvidedCategory(overall) : null;
-    const overallMissing = overall && !cats.some(c => c.toLowerCase() === String(overall).toLowerCase());
-    const suggestedNewCategory = overallMissing ? overall : (out.suggestedNewCategory || null);
-
-    const result = {
-      overallCategory: overallPicked,
-      confidence: Math.max(0, Math.min(1, Number(out.confidence ?? 0.8))),
-      suggestedNewCategory,
-      items,
-      reason: out.reason || ""
+    // Normalize shape
+    const items = Array.isArray(out.items) ? out.items : [];
+    const resp = {
+      overallCategory: out.overallCategory ?? null,
+      confidence: typeof out.confidence === "number" ? out.confidence : null,
+      suggestedNewCategory: out.suggestedNewCategory ?? null,
+      items: items.map(it => ({
+        text: String(it.text || ""),
+        category: String(it.category || "Other"),
+        subcategory: it.subcategory ?? null,
+        confidence: typeof it.confidence === "number" ? it.confidence : 0.6,
+        suggestedNewCategory: it.suggestedNewCategory ?? null
+      })),
+      reason: out.reason ?? null,
+      ms: Date.now() - t0
     };
 
-    const ms = Date.now() - t0;
-    res.json({ ...result, ms, provider: preferGemini ? "gemini" : "openai" });
+    res.json(resp);
   } catch (e) {
-    console.error("[analyze] error", e);
+    console.error("[/analyze] error", e);
     res.status(502).json({ error: "Upstream error", detail: String(e) });
   }
 });
+
+// ---------- Start ----------
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => console.log("proxy up on :" + PORT));

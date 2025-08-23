@@ -1,4 +1,9 @@
-// server.js
+// server/server.js
+// SmartListCore — Pack A (Stage 1.5)
+// Recreated to match existing structure (helmet, rate-limit, node-fetch, LRU cache)
+// and to add /analyze with userLanguages, forceCategory, subcategoryOnly.
+// Date: 2025-08-23
+
 import express from "express";
 import helmet from "helmet";
 import cors from "cors";
@@ -74,7 +79,19 @@ function validateSub(category, sub, subsByCat) {
   return list.find((s) => s.toLowerCase() === String(sub).toLowerCase()) || null;
 }
 
-// ---------- Classifier instruction (rules-only, no user-specific examples) ----------
+function normLangs(arr) {
+  if (!Array.isArray(arr)) return [];
+  const out = [];
+  const seen = new Set();
+  for (const a of arr) {
+    const v = String(a || "").trim().toLowerCase();
+    if (v && !seen.has(v)) { out.push(v); seen.add(v); }
+    if (out.length >= 5) break;
+  }
+  return out;
+}
+
+// ---------- Classifier instruction (rules-only) ----------
 const CLASSIFIER_INSTRUCTION = `
 You classify a short user note into exactly ONE of the provided categories.
 
@@ -234,7 +251,22 @@ async function routeClassify({ text, categories, subcategoriesByCat }) {
   if (OPENAI_API_KEY) {
     return await classifyWithOpenAI({ text, categories, subcategoriesByCat });
   }
-  throw new Error("No provider configured (set GEMINI_API_KEY or OPENAI_API_KEY)");
+  // Final fallback: minimal heuristic so the proxy still works during local dev
+  const trimmed = String(text || "").trim();
+  const hasTime = /\b(\d{1,2}:\d{2}\s*(am|pm)?)\b/i.test(trimmed) || /\b(today|tomorrow|monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b/i.test(trimmed);
+  const hasDo = /\b(buy|pick up|call|schedule|renew|subscribe|email|text|order)\b/i.test(trimmed);
+  let cat = "Other";
+  if (hasTime) cat = "Reminders";
+  else if (hasDo) cat = "To-do";
+  const picked = pickProvidedCategory(cat, categories) ?? "Other";
+  return {
+    provider: "heuristic",
+    category: picked,
+    subcategory: null,
+    confidence: FALLBACK_CONFIDENCE,
+    reason: "heuristic",
+    suggestedNewCategory: null
+  };
 }
 
 // ---------- Endpoints ----------
@@ -297,56 +329,75 @@ app.post("/classify-batch", async (req, res) => {
   }
 });
 
-// --- Add this new route BEFORE app.listen(...) ---
-
-// ---- ADD/REPLACE: /analyze (per-line only, no overall) ----
+// ---- NEW: /analyze (Stage 1.5) ----
+// Per-line only. No overall category. Enforces subcategoryOnly when set.
+// Accepts EITHER top-level fields OR a nested { context } for compatibility with iOS client.
 app.post("/analyze", async (req, res) => {
   try {
-    const { text, categories, subcategoriesByCat, hintsByCategory } = req.body || {};
-    if (typeof text !== "string" || !Array.isArray(categories)) {
-      return res.status(400).json({ error: "text and categories required" });
-    }
+    // Allow both shapes: { lines, context:{...} } OR legacy { text, categories, ... }
+    const body = req.body || {};
+    const lines = Array.isArray(body.lines)
+      ? body.lines
+      : String(body.text || "").split(/\r?\n/).map(s => s.replace(/^\s*-\s*\[\s*\]\s*/,"").replace(/^\s*-\s*/,"").trim()).filter(Boolean);
 
-    const INSTR = `
-Return ONLY JSON with this exact shape:
+    const ctx = body.context && typeof body.context === "object" ? body.context : body;
+
+    let { currentCategory, categories, subcategoriesByCat, userLanguages, hintsByCategory, forceCategory, subcategoryOnly } = ctx;
+    if (!Array.isArray(categories)) {
+      return res.status(400).json({ ok: false, error: "categories[] required" });
+    }
+    subcategoriesByCat = subcategoriesByCat || {};
+    hintsByCategory = hintsByCategory || {};
+    userLanguages = normLangs(userLanguages || []);
+    const lockCategory = subcategoryOnly ? (forceCategory || currentCategory || null) : null;
+
+    // Build instruction for model providers (if configured)
+    const INSTR = `Return ONLY JSON with this exact shape:
 {
-  "items": [
-    { "text": string, "category": string, "subcategory": string|null,
-      "confidence": number, "suggestedNewCategory": string|null }
-  ],
-  "reason": string|null
+  "results": [
+    { "raw": string, "category": (string|null), "subcategory": (string|null),
+      "suggestedNewCategory": (string|null), "suggestedNewSubcategory": (string|null),
+      "isReminder": boolean, "reminderDateTime": (string|null),
+      "quantity": (number|null), "confidence": number }
+  ]
 }
 
 Rules:
-- Split the TEXT by lines; ignore empty lines and "- [ ]" or "- " prefixes.
-- For each line, pick "category" from the provided CATEGORIES (case-insensitive, output casing must match provided).
-- If no provided category fits, set category to "Other" and, if a clearly better missing category exists, set "suggestedNewCategory" to ONE word (e.g., "Sports", "App feedback").
-- Prefer "Reminders" ONLY when the line contains a concrete time/date.
-- Action verbs ("buy","watch","renew","call","order","pick up", etc.) bias "To-do" unless an explicit date/time makes it a "Reminders".
-- Subcategory must be drawn from SUBCATEGORIES_BY_CATEGORY[category] if appropriate; otherwise null.
-- Use HINTS_BY_CATEGORY only to disambiguate; do not invent categories not suggested by the line.
-- Do not include any field other than items[] and reason.
+- Process each line independently; ignore empty lines and checkboxes ("- [ ] " prefix) or "- " prefix.
+- ${subcategoryOnly ? "NEVER change the category; it MUST remain " + JSON.stringify(lockCategory) + "." : "Choose category from provided CATEGORIES if subcategoryOnly is false."}
+- When subcategoryOnly=true, set suggestedNewCategory=null.
+- Suggest an existing subcategory only if it appears in SUBCATEGORIES_BY_CATEGORY[category]; otherwise consider "suggestedNewSubcategory" from the text tokens.
+- Quantities imply physical items; bias towards groceries/physical categories when not locked.
+- Reminder phrasing allowed without explicit time; if date/time is present, set reminderDateTime and increase confidence.
+- Use HINTS_BY_CATEGORY only to disambiguate; never force.
+- Include a normalized "confidence" 0..1.
+- Do not include any other fields.
 
 CATEGORIES:
 ${JSON.stringify(categories)}
 
 SUBCATEGORIES_BY_CATEGORY:
-${JSON.stringify(subcategoriesByCat || {})}
+${JSON.stringify(subcategoriesByCat)}
 
 HINTS_BY_CATEGORY:
-${JSON.stringify(hintsByCategory || {})}
+${JSON.stringify(hintsByCategory)}
 
-TEXT:
-${text}
-    `.trim();
+USER_LANGUAGES (for parsing cues; do not hardcode defaults):
+${JSON.stringify(userLanguages)}
 
-    // Prefer Gemini; fallback to OpenAI
-    const out = await (async () => {
+LOCKED_CATEGORY (optional):
+${JSON.stringify(lockCategory)}
+
+LINES:
+${JSON.stringify(lines)}
+`.trim();
+
+    async function callProvider() {
       if (GEMINI_API_KEY) {
         const url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-lite:generateContent?key=" + GEMINI_API_KEY;
         const payload = {
           contents: [{ role: "user", parts: [{ text: INSTR }] }],
-          generationConfig: { response_mime_type: "application/json", maxOutputTokens: 600 }
+          generationConfig: { response_mime_type: "application/json", maxOutputTokens: 1024 }
         };
         const r = await fetch(url, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload) });
         const j = await r.json();
@@ -372,25 +423,91 @@ ${text}
         const textOut = j?.choices?.[0]?.message?.content?.trim() || "{}";
         return JSON.parse(textOut);
       }
-      throw new Error("No provider configured");
-    })();
+      return null;
+    }
 
-    const items = Array.isArray(out.items) ? out.items : [];
-    const resp = {
-      items: items.map(it => ({
-        text: String(it.text || ""),
-        category: String(it.category || "Other"),
-        subcategory: it.subcategory ?? null,
-        confidence: typeof it.confidence === "number" ? it.confidence : 0.6,
-        suggestedNewCategory: it.suggestedNewCategory ?? null
-      })),
-      reason: out.reason ?? null
-    };
+    function heuristicOne(line) {
+      const raw = String(line || "");
+      const hasTime = /\b(\d{1,2}(:\d{2})?\s*(am|pm)?)\b/i.test(raw) || /\b(today|tomorrow|monday|tuesday|wednesday|thursday|friday|saturday|sunday|\\d{4}-\\d{2}-\\d{2})\b/i.test(raw);
+      const isReminder = /\b(remind|follow\s*up|pay|renew|call|email|text|schedule|book|register|submit)\b/i.test(raw) || hasTime;
+      const qty = (() => {
+        const m = raw.match(/(?:^|\\s)(\\d+(?:\\.\\d+)?)\\s*(?:x|×)\\s*[^\\s]/i)
+          || raw.match(/(?:^|\\s)[^\\s]+\\s*(?:x|×)\\s*(\\d+(?:\\.\\d+)?)/i)
+          || raw.match(/(?:^|\\s)(\\d+(?:\\.\\d+)?)\\s*(?:pcs?|lb|lbs|pounds?|kg|g|oz|pack|packs|bag|bags)\\b/i)
+          || raw.match(/(?:^|\\s)(\\d+(?:\\.\\d+)?)(?=\\s+[a-zA-Z])/i);
+        return m ? Number(m[1] || m[2] || 1) : null;
+      })();
+      let category = null;
+      if (subcategoryOnly) {
+        category = lockCategory;
+      } else if (qty) {
+        // try bias to groceries-like category name
+        const gi = (categories || []).find((c) => /grocery|grocer|shopping|store|market|food|pantry|cart/i.test(String(c)));
+        category = gi || null;
+      }
+      // simple subcategory nudge
+      const subs = (subcategoryOnly ? (subcategoriesByCat[lockCategory] || []) : (subcategoriesByCat[category] || []));
+      let sub = null;
+      for (const s of subs) {
+        const n = String(s).toLowerCase();
+        if (n && raw.toLowerCase().includes(n)) { sub = s; break; }
+      }
+      const conf = clamp((subcategoryOnly ? 0.65 : 0.55) + (qty ? 0.1 : 0) + (isReminder ? 0.1 : 0), 0, 0.95);
+      return {
+        raw,
+        category,
+        subcategory: sub,
+        suggestedNewCategory: subcategoryOnly ? null : null,
+        suggestedNewSubcategory: sub ? null : null,
+        isReminder: !!isReminder,
+        reminderDateTime: null,
+        quantity: qty,
+        confidence: conf
+      };
+    }
 
-    res.json(resp);
+    let providerOut = await callProvider();
+    let results = [];
+    if (providerOut && Array.isArray(providerOut.results)) {
+      results = providerOut.results.map((r) => {
+        // Enforce locks and normalize
+        const cat = subcategoryOnly ? (lockCategory ?? null) : (r.category ?? null);
+        return {
+          raw: String(r.raw || ""),
+          category: cat,
+          subcategory: r.subcategory ?? null,
+          suggestedNewCategory: subcategoryOnly ? null : (r.suggestedNewCategory ?? null),
+          suggestedNewSubcategory: r.suggestedNewSubcategory ?? null,
+          isReminder: !!r.isReminder,
+          reminderDateTime: r.reminderDateTime ?? null,
+          quantity: typeof r.quantity === "number" ? r.quantity : null,
+          confidence: typeof r.confidence === "number" ? clamp(r.confidence, 0, 1) : FALLBACK_CONFIDENCE
+        };
+      });
+    } else {
+      // Heuristic path per line
+      results = lines.map(heuristicOne);
+    }
+
+    // Final guard: validate subcategories against provided mapping
+    results = results.map((r) => {
+      if (!r) return r;
+      const cat = r.category;
+      if (cat && r.subcategory) {
+        const valid = validateSub(cat, r.subcategory, subcategoriesByCat);
+        r.subcategory = valid || null;
+      }
+      if (subcategoryOnly) {
+        r.category = lockCategory ?? null;
+        r.suggestedNewCategory = null;
+      }
+      return r;
+    });
+
+    res.json({ ok: true, results });
   } catch (e) {
     console.error("[/analyze] error", e);
-    res.status(502).json({ error: "Upstream error", detail: String(e) });
+    res.status(502).json({ ok: false, error: "Upstream error", detail: String(e?.message || e) });
   }
 });
 

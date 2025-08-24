@@ -1,3 +1,4 @@
+// server.js — SmartNotes proxy (exact prompts + hardened + Rule #2 post-fix)
 import 'dotenv/config';
 import express from 'express';
 import cors from 'cors';
@@ -6,7 +7,7 @@ import rateLimit from 'express-rate-limit';
 import { GoogleGenerativeAI } from '@google/generative-ai';
 import OpenAI from 'openai';
 
-/* ---------- Inline: exact prompt builders ---------- */
+/* ---------- Prompt builders (inline) ---------- */
 const pretty = (obj) => JSON.stringify(obj ?? {}, null, 2);
 
 function buildClassifyPrompt({ text, languages = [], categories = [], subcats = {}, hints = {} }) {
@@ -122,7 +123,7 @@ INTERPRETATION RULES (language-aware, dynamic)
    - Prefer "Shopping" for non-food tangible items if "Groceries" doesn’t apply.  
 
 CONSTRAINTS:  
-- Category MUST be from CATEGORIES (use provided casing). If no fit, choose "Other".  
+- Category MUST be from CATEGORIES (use provided casing).  
 - Only output a subcategory if it already exists under the chosen category AND confidence ≥ 0.8; otherwise null.  
 - Output JSON only. No markdown or extra text.  
 
@@ -131,7 +132,7 @@ ${joined}
 `.trim();
 }
 
-/* ---------- Inline: strict mappers ---------- */
+/* ---------- Mappers ---------- */
 function tryParseJSON(s) {
   if (!s) return null;
   try { return JSON.parse(s); } catch {}
@@ -172,7 +173,7 @@ function mapAnalyze(modelText, lines) {
     suggestedNewCategory: it.suggestedNewCategory ?? null,
     suggestedNewSubcategory: it.suggestedNewSubcategory ?? null
   }));
-  return { provider:'model', items: out, __raw: modelText };
+  return { provider:'model', items: out, __raw:modelText };
 }
 
 /* ---------- App ---------- */
@@ -196,7 +197,7 @@ function requireAppKey(req, res, next) {
   return res.status(401).json({ error: 'Unauthorized' });
 }
 
-// Providers (Gemini first, OpenAI fallback)
+// Providers (Gemini primary, OpenAI fallback)
 const geminiKey = process.env.GEMINI_API_KEY;
 const genAI = geminiKey ? new GoogleGenerativeAI(geminiKey) : null;
 const openaiKey = process.env.OPENAI_API_KEY;
@@ -213,10 +214,10 @@ const capHints = (h, max = 100) => {
 const safeParse = (s) => { try { return JSON.parse(String(s||'').trim()); } catch { return null; } };
 
 async function callLLM({ prompt }) {
-  // Gemini primary
+  // Gemini primary (2.5 Flash-Lite)
   if (genAI) {
     try {
-      const model = genAI.getGenerativeModel({ model: 'gemini-1.5-flash' });
+      const model = genAI.getGenerativeModel({ model: 'gemini-2.5-flash-lite' });
       const r = await model.generateContent({
         contents: [{ role: 'user', parts: [{ text: prompt }]}],
         generationConfig: { responseMimeType: 'application/json' }
@@ -228,11 +229,11 @@ async function callLLM({ prompt }) {
       if (DEBUG_AI) console.error('[gemini] error:', e?.message || e);
     }
   }
-  // OpenAI fallback
+  // OpenAI fallback (GPT-5 nano)
   if (openai) {
     try {
       const r = await openai.chat.completions.create({
-        model: openaiModel,
+        model: 'gpt-5-nano',
         messages: [{ role: 'user', content: prompt }],
         response_format: { type: 'json_object' },
         temperature: 0
@@ -246,7 +247,6 @@ async function callLLM({ prompt }) {
   }
   throw new Error('LLM providers failed');
 }
-
 function sanitizeSingle(obj, categories, subcats) {
   const valid = new Set(Array.isArray(categories) ? categories : []);
   const out = {
@@ -280,6 +280,7 @@ function sanitizeSingle(obj, categories, subcats) {
   return out;
 }
 
+/* ---------- Routes ---------- */
 app.get('/health', (_req, res) => res.json({ ok: true }));
 
 app.post('/classify', requireAppKey, async (req, res) => {
@@ -314,13 +315,21 @@ app.post('/classify', requireAppKey, async (req, res) => {
 
     const clean = sanitizeSingle(mapped, categories, subcategoriesByCategory);
 
+    // POST-RULE (Rule #2): ingredient/produce → Groceries
+    if (clean.category === 'Other' &&
+        (clean.suggestedNewCategory || '').toLowerCase() === 'food') {
+      clean.category = 'Groceries';
+      clean.suggestedNewCategory = null;
+      clean.reason = (clean.reason ? clean.reason + ' ' : '') + '(rule 2: ingredient → Groceries)';
+    }
+
     if (req.query.debug === '1') {
       clean.__debug = { prompt: trunc(prompt, 8000), raw: trunc(raw, 4000) };
     }
     if (DEBUG_AI) {
-      console.log('[classify] promptCtx cats:', categories);
-      console.log('[classify] promptCtx langs:', languages);
-      console.log('[classify] mapped:', clean);
+      console.log('[classify] cats:', categories);
+      console.log('[classify] langs:', languages);
+      console.log('[classify] out:', clean);
     }
     res.json(clean);
   } catch (e) {
@@ -359,15 +368,23 @@ app.post('/analyze', requireAppKey, async (req, res) => {
 
     const { provider, raw, parsed } = await callLLM({ prompt });
     const mapped = mapAnalyze(JSON.stringify(parsed), lines);
-    const items = mapped.items.map(it =>
-      sanitizeSingle({ ...it, provider }, categories, subcategoriesByCategory)
-    );
+    const items = mapped.items.map(it => {
+      const x = sanitizeSingle({ ...it, provider }, categories, subcategoriesByCategory);
+      // POST-RULE (Rule #2): ingredient/produce → Groceries
+      if (x.category === 'Other' &&
+          (x.suggestedNewCategory || '').toLowerCase() === 'food') {
+        x.category = 'Groceries';
+        x.suggestedNewCategory = null;
+        x.reason = (x.reason ? x.reason + ' ' : '') + '(rule 2: ingredient → Groceries)';
+      }
+      return x;
+    });
 
     const payload = { items };
     if (req.query.debug === '1') payload.__debug = { prompt: trunc(prompt, 8000), raw: trunc(raw, 4000) };
     if (DEBUG_AI) {
-      console.log('[analyze] promptCtx cats:', categories);
-      console.log('[analyze] promptCtx langs:', languages);
+      console.log('[analyze] cats:', categories);
+      console.log('[analyze] langs:', languages);
       console.log('[analyze] items:', items.length);
     }
     res.json(payload);

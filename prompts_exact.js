@@ -1,9 +1,14 @@
-// server/prompts_exact.js
-// Builds EXACT prompts per your provided spec (no examples, no tweaks).
+// prompts_exact.js (ESM)
 
 const pretty = (obj) => JSON.stringify(obj ?? {}, null, 2);
 
-function buildClassifyPrompt({ text, languages = [], categories = [], subcats = {}, hints = {} }) {
+export function buildClassifyPrompt({
+  text,
+  languages = [],
+  categories = [],
+  subcats = {},
+  hints = {}
+}) {
   return `
 /classify
 
@@ -55,12 +60,22 @@ CONSTRAINTS:
 - Output JSON only. No markdown or extra text.    
 
 TEXT TO CLASSIFY:
-${text}
+${text ?? ''}
 `.trim();
 }
 
-function buildAnalyzePrompt({ lines, languages = [], categories = [], subcats = {}, hints = {} }) {
-  const joined = (lines ?? []).join("\n");
+export function buildAnalyzePrompt({
+  // Accept either an array of lines OR a single concatenated text
+  lines,
+  text,
+  languages = [],
+  categories = [],
+  subcats = {},
+  hints = {}
+}) {
+  const joined = Array.isArray(lines)
+    ? lines.join('\n')
+    : String(text ?? '');
   return `
 /analyze:
 
@@ -124,5 +139,3 @@ TEXT TO CLASSIFY:
 ${joined}
 `.trim();
 }
-
-module.exports = { buildClassifyPrompt, buildAnalyzePrompt };

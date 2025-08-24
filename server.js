@@ -1,399 +1,313 @@
-// server.js
-import express from "express";
-import helmet from "helmet";
-import cors from "cors";
-import rateLimit from "express-rate-limit";
-import fetch from "node-fetch";
+import 'dotenv/config';
+import express from 'express';
+import cors from 'cors';
+import helmet from 'helmet';
+import morgan from 'morgan';
+import rateLimit from 'express-rate-limit';
+import LRUCache from 'lru-cache';
+import { GoogleGenerativeAI } from '@google/generative-ai';
+import OpenAI from 'openai';
 
-// ---------- App setup ----------
 const app = express();
-app.use(helmet());
-app.use(cors());
-app.use(express.json({ limit: "512kb" }));
-app.set("trust proxy", 1);
+const PORT = process.env.PORT || 7845;
+const APP_KEY = process.env.APP_KEY || '';
 
-const limiter = rateLimit({ windowMs: 60 * 1000, max: 120 });
+app.use(express.json({ limit: '1mb' }));
+app.use(cors());
+app.use(helmet());
+app.use(morgan('tiny'));
+
+const limiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: 120, // 120 req/min per IP
+});
 app.use(limiter);
 
-// ---------- ENV ----------
-const GEMINI_API_KEY = process.env.GEMINI_API_KEY || "";
-const OPENAI_API_KEY = process.env.OPENAI_API_KEY || "";
-const OPENAI_MODEL   = process.env.OPENAI_MODEL || "gpt-5-nano";
-const DEBUG_LOG      = process.env.DEBUG_LOG === "1";
-const FALLBACK_CONFIDENCE = Number(process.env.FALLBACK_CONFIDENCE || "0.6");
-
-// ---------- Tiny LRU cache ----------
-const LRU_MAX = 5000;
-const CACHE_TTL_MS = 7 * 24 * 3600 * 1000;
-const CACHE = new Map(); // key -> { ts, value }
-
-function cacheKey({ text, categories, subcategoriesByCat }) {
-  return JSON.stringify({
-    t: String(text || "").trim().toLowerCase(),
-    c: (categories || []).map((c) => c.toLowerCase()).sort(),
-    s: Object.fromEntries(
-      Object.entries(subcategoriesByCat || {}).map(([k, v]) => [
-        k.toLowerCase(),
-        (v || []).map((x) => x.toLowerCase()).sort(),
-      ])
-    ),
-  });
-}
-function cacheGet(key) {
-  const hit = CACHE.get(key);
-  if (!hit) return null;
-  if (Date.now() - hit.ts > CACHE_TTL_MS) {
-    CACHE.delete(key);
-    return null;
-  }
-  return hit.value;
-}
-function cacheSet(key, value) {
-  if (CACHE.size > LRU_MAX) {
-    const first = CACHE.keys().next().value;
-    if (first) CACHE.delete(first);
-  }
-  CACHE.set(key, { ts: Date.now(), value });
+function requireAppKey(req, res, next) {
+  if (!APP_KEY) return next(); // allow in dev if key not set
+  const key = req.get('X-App-Key');
+  if (key && key === APP_KEY) return next();
+  return res.status(401).json({ error: 'Unauthorized' });
 }
 
-// ---------- Helpers ----------
-function clamp(x, lo, hi) { return Math.max(lo, Math.min(hi, x)); }
+// Simple normalized-text -> JSON LRU
+const cache = new LRUCache({
+  max: 2000,
+  ttl: 5 * 60 * 1000, // 5 min
+});
 
-function pickProvidedCategory(modelOut, provided) {
-  if (!modelOut || !provided?.length) return null;
-  const m = String(modelOut).toLowerCase();
-  for (const p of provided) {
-    if (String(p).toLowerCase() === m) return p; // keep provided casing
-  }
-  return null;
-}
+// Clients
+const geminiKey = process.env.GEMINI_API_KEY;
+const genAI = geminiKey ? new GoogleGenerativeAI(geminiKey) : null;
+const openaiKey = process.env.OPENAI_API_KEY;
+const openai = openaiKey ? new OpenAI({ apiKey: openaiKey }) : null;
+const openaiModel = process.env.OPENAI_MODEL || 'gpt-4o-mini';
 
-function validateSub(category, sub, subsByCat) {
-  if (!sub || !category) return null;
-  const list = subsByCat?.[category] || [];
-  return list.find((s) => s.toLowerCase() === String(sub).toLowerCase()) || null;
-}
+// Prompt templates (from user's finalized spec)
+function buildClassifyPrompt(payload) {
+  const { text, categories, subcategoriesByCategory = {}, hintsByCategory = {}, languages = [] } = payload;
 
-// ---------- Classifier instruction (rules-only, no user-specific examples) ----------
-const CLASSIFIER_INSTRUCTION = `
-You classify a short user note into exactly ONE of the provided categories.
+  return `/classify
+You are a deterministic short-text classifier.
 
-CATEGORIES (intended meaning)
-- Reminders: explicit time/date present (“at 4:30”, “tomorrow”, weekdays, ISO times).
-- To-do: task phrasing (buy, pick up, call, schedule, renew, subscribe) with NO explicit time.
-- Groceries: food/ingredients/edibles or common household consumables (eggs, sugar, cilantro, detergent).
-- Movies: film-related with media signals (movie/film/trailer/watch + title/year/actor/director).
-- Shows: TV/series/anime/cartoon with signals (show/series/episode/season).
-- Other: everything else.
-
-AMBIGUITY POLICY (CRITICAL)
-If the text is short and could be multiple things (e.g., a single proper noun with no context),
-do NOT guess. Use "category":"Other" AND set "suggestedNewCategory" to a concise type (e.g., "Sports", "Cars", "Books", "Shopping") inferred from general knowledge.
-
-SUBCATEGORIES
-Return a subcategory ONLY if it exists in the provided mapping for the chosen category; else null.
-
-CONFIDENCE
-Return a value 0..1. Penalize short/ambiguous inputs; increase only when explicit signals exist.
-
-OUTPUT
-Return STRICT JSON (no prose, no markdown):
+Return ONLY a single JSON object with this schema:
 {
-  "category": string,             // must be one of the provided categories
-  "subcategory": string|null,     // must be from subcategoriesByCat[category] or null
-  "confidence": number,           // 0..1
+  "category": string,
+  "subcategory": string|null,
+  "confidence": number,
   "reason": string,
-  "suggestedNewCategory": string|null
-}
-`;
-
-// ---------- Gemini primary ----------
-async function classifyWithGemini({ text, categories, subcategoriesByCat }) {
-  if (!GEMINI_API_KEY) throw new Error("Missing GEMINI_API_KEY");
-
-  const url =
-    "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-lite:generateContent?key=" +
-    GEMINI_API_KEY;
-
-  const cats = Array.isArray(categories) ? categories : [];
-  const subs = subcategoriesByCat && typeof subcategoriesByCat === "object" ? subcategoriesByCat : {};
-
-  // Ambiguity nudge for short proper nouns with no obvious signals
-  const trimmed = String(text || "").trim();
-  const isShort  = trimmed.split(/\s+/).length <= 2;
-  const looksProper = /^[A-Z][a-z]+$/.test(trimmed);
-  const hasSignals = /\b(movie|film|show|series|episode|season|watch|buy|order|call|email|tomorrow|today|monday|tuesday|wednesday|thursday|friday|saturday|sunday|\d{1,2}:\d{2}|am|pm|kg|g|oz|lb|lbs|dozen)\b/i.test(trimmed);
-
-  const ambiguityHint = (isShort && looksProper && !hasSignals)
-    ? "The input looks like a short proper noun without clear signals. Do not guess; use category 'Other' and propose a concise suggestedNewCategory if a generic type is obvious (e.g., Sports, Cars, Books)."
-    : "";
-
-  const userText =
-    CLASSIFIER_INSTRUCTION +
-    (ambiguityHint ? ("\n\nAMBIGUITY HINT:\n" + ambiguityHint) : "") +
-    "\n\nPROVIDED CATEGORIES:\n" + JSON.stringify(cats) +
-    "\n\nSUBCATEGORIES_BY_CATEGORY:\n" + JSON.stringify(subs) +
-    "\n\nTEXT:\n" + text;
-
-  const payload = {
-    contents: [{ role: "user", parts: [{ text: userText }] }],
-    generationConfig: { response_mime_type: "application/json" },
-  };
-
-  const ac = new AbortController();
-  const to = setTimeout(() => ac.abort(), 8000); // 8s guard
-  try {
-    const r = await fetch(url, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(payload),
-      signal: ac.signal,
-    });
-    const j = await r.json();
-    const textOut = j?.candidates?.[0]?.content?.parts?.[0]?.text?.trim();
-    const out = JSON.parse(textOut || "{}");
-
-    const picked = pickProvidedCategory(out.category, cats);
-    return {
-      provider: "gemini",
-      category: picked ?? "Other",
-      subcategory: validateSub(picked ?? "Other", out.subcategory, subs),
-      confidence: clamp(out.confidence ?? FALLBACK_CONFIDENCE, 0, 1),
-      reason: out.reason || "",
-      suggestedNewCategory: out.suggestedNewCategory || null,
-    };
-  } finally {
-    clearTimeout(to);
-  }
+  "suggestedNewCategory": string|null,
+  "suggestedNewSubcategory": string|null,
+  "alternativeCategory": string|null
 }
 
-// ---------- OpenAI fallback ----------
-async function classifyWithOpenAI({ text, categories, subcategoriesByCat }) {
-  if (!OPENAI_API_KEY) throw new Error("Missing OPENAI_API_KEY");
+CONTEXT:
+- USER_PREFERRED_LANGUAGES: ${JSON.stringify(languages)}
+- CATEGORIES: ${JSON.stringify(categories)}
+- SUBCATEGORIES_BY_CATEGORY: ${JSON.stringify(subcategoriesByCategory)}
+- HINTS_BY_CATEGORY: ${JSON.stringify(capHints(hintsByCategory, 100))}
 
-  const url = "https://api.openai.com/v1/chat/completions";
-  const cats = Array.isArray(categories) ? categories : [];
-  const subs = subcategoriesByCat && typeof subcategoriesByCat === "object" ? subcategoriesByCat : {};
+DECISION ORDER (strict):
+1) Normalize spelling/transliteration/synonyms across USER_PREFERRED_LANGUAGES before classifying.
+2) If TEXT is empty/whitespace → category="Other", confidence ≤ 0.5.
+3) Reminders have priority:
+   - If explicit time/date/weekday/relative date OR reminder phrasing ("remind me","set a reminder","reminder to") → category="Reminders".
+   - If reminder phrasing without a concrete time, choose "Reminders" with moderate confidence (0.6–0.75).
+4) Quantities → physical items:
+   - If TEXT contains quantity markers ("x2","2kg","3 packs","2", etc.), treat as PHYSICAL ITEM.
+   - Do NOT classify as "Movies"/"Shows" unless explicit media cues exist ("season","episode","trailer","movie","series","watch").
+   - If ingredient/consumable → "Groceries".
+   - If prepared dish/cuisine item → "Other", suggestedNewCategory="Food".
+5) Media:
+   - Clear film title → "Movies"
+   - Clear episodic/series → "Shows"
+6) Actions (no reminder phrasing/time):
+   - Action verbs ("buy","get","renew","call","watch","pickup","order") bias "To-do".
+   - If both a task verb and a media title (e.g., "watch Moana") → category="To-do", alternativeCategory="Movies" (or "Shows").
+7) App/feature/bug/UX/dev tasks without explicit time → "App".
+8) If no confident fit within CATEGORIES, choose "Other" and set suggestedNewCategory to the best single word (e.g., "Food","Shopping","Cosmetics","Sports","Finance").
+9) Subcategories:
+   - Only output a subcategory if it exists under the chosen category AND confidence ≥ 0.8. Otherwise null.
 
-  const userText =
-    CLASSIFIER_INSTRUCTION +
-    "\n\nPROVIDED CATEGORIES:\n" + JSON.stringify(cats) +
-    "\n\nSUBCATEGORIES_BY_CATEGORY:\n" + JSON.stringify(subs) +
-    "\n\nTEXT:\n" + text;
+HINT USAGE:
+- Treat HINTS_BY_CATEGORY as user-learned examples to improve accuracy; never echo hints in the reason.
+- If TEXT exactly or nearly matches a hint for a category, increase confidence accordingly.
 
-  const payload = {
-    model: OPENAI_MODEL,
-    messages: [
-      { role: "system", content: "You are a JSON-only classifier. Output valid JSON object only." },
-      { role: "user", content: userText }
-    ],
-    response_format: { type: "json_object" }
-  };
+CONSTRAINTS:
+- "category" MUST be one of CATEGORIES using provided casing; if no fit, use "Other".
+- "alternativeCategory" (if present) MUST also be from CATEGORIES and different from "category".
+- "subcategory" MUST be valid under the chosen category if used; else null.
+- Output JSON only. No extra text, no markdown, no trailing commas.
 
-  const ac = new AbortController();
-  const to = setTimeout(() => ac.abort(), 8000);
-  try {
-    const r = await fetch(url, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "Authorization": `Bearer ${OPENAI_API_KEY}`
-      },
-      body: JSON.stringify(payload),
-      signal: ac.signal,
-    });
-    const j = await r.json();
-    const textOut = j?.choices?.[0]?.message?.content?.trim();
-    const out = JSON.parse(textOut || "{}");
-
-    const picked = pickProvidedCategory(out.category, cats);
-    return {
-      provider: "openai",
-      category: picked ?? "Other",
-      subcategory: validateSub(picked ?? "Other", out.subcategory, subs),
-      confidence: clamp(out.confidence ?? FALLBACK_CONFIDENCE, 0, 1),
-      reason: out.reason || "",
-      suggestedNewCategory: out.suggestedNewCategory || null,
-    };
-  } finally {
-    clearTimeout(to);
-  }
+TEXT TO CLASSIFY:
+${text}`;
 }
 
-// ---------- Router with fallback logic ----------
-async function routeClassify({ text, categories, subcategoriesByCat }) {
-  // Primary: Gemini
-  if (GEMINI_API_KEY) {
-    try {
-      return await classifyWithGemini({ text, categories, subcategoriesByCat });
-    } catch (e) {
-      if (DEBUG_LOG) console.warn("[route] Gemini failed, falling back to OpenAI:", String(e));
-    }
-  }
-  // Fallback: OpenAI
-  if (OPENAI_API_KEY) {
-    return await classifyWithOpenAI({ text, categories, subcategoriesByCat });
-  }
-  throw new Error("No provider configured (set GEMINI_API_KEY or OPENAI_API_KEY)");
-}
+function buildAnalyzePrompt(payload) {
+  const { text, categories, subcategoriesByCategory = {}, hintsByCategory = {}, languages = [] } = payload;
 
-// ---------- Endpoints ----------
-app.get("/health", (_req, res) => {
-  res.json({
-    ok: true,
-    primary: GEMINI_API_KEY ? "gemini" : (OPENAI_API_KEY ? "openai" : "none"),
-    fallback: OPENAI_API_KEY ? "openai" : "none",
-    cacheSize: CACHE.size
-  });
-});
+  return `/analyze
+You are a deterministic multi-line text classifier.
 
-app.post("/classify", async (req, res) => {
-  const t0 = Date.now();
-  try {
-    const { text, categories, subcategoriesByCat } = req.body || {};
-    if (!text || !Array.isArray(categories)) {
-      return res.status(400).json({ error: "text and categories required" });
-    }
-    const key = cacheKey({ text, categories, subcategoriesByCat });
-    const cached = cacheGet(key);
-    if (cached) return res.json({ ...cached, cached: true, ms: 0 });
-
-    if (DEBUG_LOG) console.log(`[classify] start text="${String(text).slice(0, 80)}"`);
-    const out = await routeClassify({ text, categories, subcategoriesByCat });
-    cacheSet(key, out);
-    const ms = Date.now() - t0;
-    if (DEBUG_LOG) console.log(`[classify] done ${ms}ms via ${out.provider} -> ${out.category}/${out.subcategory ?? "—"} conf=${out.confidence}`);
-    res.json({ ...out, cached: false, ms });
-  } catch (e) {
-    console.error("[classify] error", e);
-    res.status(502).json({ error: "Upstream error", detail: String(e) });
-  }
-});
-
-app.post("/classify-batch", async (req, res) => {
-  const t0 = Date.now();
-  try {
-    const { items, categories, subcategoriesByCat } = req.body || {};
-    if (!Array.isArray(items) || !Array.isArray(categories)) {
-      return res.status(400).json({ error: "items[] and categories[] required" });
-    }
-    if (DEBUG_LOG) console.log(`[batch] start n=${items.length}`);
-    const results = await Promise.all(
-      items.map(async (text) => {
-        const key = cacheKey({ text, categories, subcategoriesByCat });
-        const cached = cacheGet(key);
-        if (cached) return { ...cached, cached: true, ms: 0 };
-        const out = await routeClassify({ text, categories, subcategoriesByCat });
-        cacheSet(key, out);
-        return { ...out, cached: false, ms: 0 };
-      })
-    );
-    const ms = Date.now() - t0;
-    if (DEBUG_LOG) console.log(`[batch] done ${ms}ms`);
-    res.json({ results, ms });
-  } catch (e) {
-    console.error("[batch] error", e);
-    res.status(502).json({ error: "Upstream error", detail: String(e) });
-  }
-});
-
-// --- Add this new route BEFORE app.listen(...) ---
-
-// ---- ADD/REPLACE: /analyze (per-line only, no overall) ----
-app.post("/analyze", async (req, res) => {
-  try {
-    const { text, categories, subcategoriesByCat, hintsByCategory } = req.body || {};
-    if (typeof text !== "string" || !Array.isArray(categories)) {
-      return res.status(400).json({ error: "text and categories required" });
-    }
-
-    const INSTR = `
-Return ONLY JSON with this exact shape:
+Return ONLY a single JSON object with this schema:
 {
   "items": [
-    { "text": string, "category": string, "subcategory": string|null,
-      "confidence": number, "suggestedNewCategory": string|null }
-  ],
-  "reason": string|null
+    {
+      "text": string,
+      "category": string,
+      "subcategory": string|null,
+      "confidence": number,
+      "reason": string,
+      "suggestedNewCategory": string|null,
+      "suggestedNewSubcategory": string|null
+    }
+  ]
 }
 
-Rules:
-- Split the TEXT by lines; ignore empty lines and "- [ ]" or "- " prefixes.
-- For each line, pick "category" from the provided CATEGORIES (case-insensitive, output casing must match provided).
-- If no provided category fits, set category to "Other" and, if a clearly better missing category exists, set "suggestedNewCategory" to ONE word (e.g., "Sports", "App feedback").
-- Prefer "Reminders" ONLY when the line contains a concrete time/date.
-- Action verbs ("buy","watch","renew","call","order","pick up", etc.) bias "To-do" unless an explicit date/time makes it a "Reminders".
-- Subcategory must be drawn from SUBCATEGORIES_BY_CATEGORY[category] if appropriate; otherwise null.
-- Use HINTS_BY_CATEGORY only to disambiguate; do not invent categories not suggested by the line.
-- Do not include any field other than items[] and reason.
+CONTEXT:
+- USER_PREFERRED_LANGUAGES: ${JSON.stringify(languages)}
+- CATEGORIES: ${JSON.stringify(categories)}
+- SUBCATEGORIES_BY_CATEGORY: ${JSON.stringify(subcategoriesByCategory)}
+- HINTS_BY_CATEGORY: ${JSON.stringify(capHints(hintsByCategory, 100))}
 
-CATEGORIES:
-${JSON.stringify(categories)}
+RULES:
+1) Preserve input order. Each non-empty line is classified independently. Do not merge or invent items. Ignore empty lines.
+2) Normalize spelling/transliteration/synonyms across USER_PREFERRED_LANGUAGES before classifying.
+3) Reminders have priority:
+   - Explicit time/date/weekday/relative date OR reminder phrasing ("remind me", "set a reminder", "reminder to") → "Reminders".
+   - Without concrete time but with reminder phrasing → "Reminders" with confidence 0.6–0.75.
+4) Quantities → physical items:
+   - If a line contains quantity markers ("x2","2","2kg","3 packs"), treat as PHYSICAL ITEM.
+   - Do NOT classify as "Movies"/"Shows" unless explicit media cues exist ("season","episode","trailer","movie","series","watch").
+   - Ingredient/consumable → "Groceries".
+   - Prepared dish/cuisine item → "Other", suggestedNewCategory="Food".
+5) Media:
+   - Film titles → "Movies"
+   - Episodic/series → "Shows"
+   - If phrased as an action (e.g., "watch Moana trailer") it may also be "To-do"; choose the stronger intent.
+6) Actions (no reminder phrasing/time):
+   - Verbs ("buy","get","renew","call","watch","pickup","order") bias "To-do".
+7) App/feature/bug/UX/dev tasks without explicit time → "App".
+8) If no confident fit, choose "Other" and set suggestedNewCategory to the best single word (e.g., "Food","Shopping","Cosmetics","Sports","Finance").
+9) Subcategories:
+   - Only output a subcategory if it exists under the chosen category AND confidence ≥ 0.8. Otherwise null.
 
-SUBCATEGORIES_BY_CATEGORY:
-${JSON.stringify(subcategoriesByCat || {})}
+HINT USAGE:
+- Treat HINTS_BY_CATEGORY as user-learned examples; never echo hints in reasons.
+- If a line exactly or nearly matches a hint, increase confidence accordingly.
 
-HINTS_BY_CATEGORY:
-${JSON.stringify(hintsByCategory || {})}
+CONSTRAINTS:
+- "category" MUST be from CATEGORIES using provided casing; if no fit, use "Other".
+- Output JSON only. No extra text, no markdown, no trailing commas.
 
-TEXT:
-${text}
-    `.trim();
+TEXT TO ANALYZE:
+${text}`;
+}
 
-    // Prefer Gemini; fallback to OpenAI
-    const out = await (async () => {
-      if (GEMINI_API_KEY) {
-        const url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-lite:generateContent?key=" + GEMINI_API_KEY;
-        const payload = {
-          contents: [{ role: "user", parts: [{ text: INSTR }] }],
-          generationConfig: { response_mime_type: "application/json", maxOutputTokens: 600 }
-        };
-        const r = await fetch(url, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload) });
-        const j = await r.json();
-        const textOut = j?.candidates?.[0]?.content?.parts?.[0]?.text?.trim() || "{}";
-        return JSON.parse(textOut);
-      }
-      if (OPENAI_API_KEY) {
-        const url = "https://api.openai.com/v1/chat/completions";
-        const payload = {
-          model: OPENAI_MODEL,
-          messages: [
-            { role: "system", content: "Return JSON only." },
-            { role: "user", content: INSTR }
-          ],
-          response_format: { type: "json_object" }
-        };
-        const r = await fetch(url, {
-          method: "POST",
-          headers: { "Content-Type": "application/json", "Authorization": `Bearer ${OPENAI_API_KEY}` },
-          body: JSON.stringify(payload)
-        });
-        const j = await r.json();
-        const textOut = j?.choices?.[0]?.message?.content?.trim() || "{}";
-        return JSON.parse(textOut);
-      }
-      throw new Error("No provider configured");
-    })();
+// helper to cap hints per category
+function capHints(hintsByCategory, maxPerCat = 100) {
+  const out = {};
+  for (const [cat, arr] of Object.entries(hintsByCategory || {})) {
+    if (Array.isArray(arr)) {
+      out[cat] = arr.slice(0, maxPerCat);
+    }
+  }
+  return out;
+}
 
-    const items = Array.isArray(out.items) ? out.items : [];
-    const resp = {
-      items: items.map(it => ({
-        text: String(it.text || ""),
-        category: String(it.category || "Other"),
-        subcategory: it.subcategory ?? null,
-        confidence: typeof it.confidence === "number" ? it.confidence : 0.6,
-        suggestedNewCategory: it.suggestedNewCategory ?? null
-      })),
-      reason: out.reason ?? null
-    };
+function normalizeKey(s) {
+  return String(s || '').trim().toLowerCase();
+}
 
-    res.json(resp);
+// Strict JSON parse with minimal cleanup
+function safeJsonParse(s) {
+  try {
+    if (typeof s !== 'string') return null;
+    const trimmed = s.trim();
+    if (!trimmed) return null;
+    return JSON.parse(trimmed);
   } catch (e) {
-    console.error("[/analyze] error", e);
-    res.status(502).json({ error: "Upstream error", detail: String(e) });
+    return null;
+  }
+}
+
+// Try Gemini then OpenAI
+async function callLLM({ prompt }) {
+  // 1) Gemini
+  if (genAI) {
+    try {
+      const model = genAI.getGenerativeModel({ model: 'gemini-1.5-flash' });
+      const r = await model.generateContent({
+        contents: [{ role: 'user', parts: [{ text: prompt }]}],
+        generationConfig: { responseMimeType: 'application/json' }
+      });
+      const text = r?.response?.text?.() ?? r?.response?.candidates?.[0]?.content?.parts?.[0]?.text ?? '';
+      const parsed = safeJsonParse(text);
+      if (parsed) return parsed;
+    } catch (e) {}
+  }
+  // 2) OpenAI fallback
+  if (openai) {
+    try {
+      const r = await openai.chat.completions.create({
+        model: openaiModel,
+        messages: [{ role: 'user', content: prompt }],
+        response_format: { type: 'json_object' },
+        temperature: 0
+      });
+      const text = r?.choices?.[0]?.message?.content || '';
+      const parsed = safeJsonParse(text);
+      if (parsed) return parsed;
+    } catch (e) {}
+  }
+  throw new Error('All providers failed');
+}
+
+// Validate category/subcategory and clamp confidence
+function sanitizeSingle(obj, categories, subcatsByCat) {
+  const CATS = Array.isArray(categories) ? categories : [];
+  const catSet = new Set(CATS);
+  const out = {
+    category: 'Other',
+    subcategory: null,
+    confidence: 0,
+    reason: '',
+    suggestedNewCategory: null,
+    suggestedNewSubcategory: null,
+    alternativeCategory: null,
+  };
+  if (!obj || typeof obj !== 'object') return out;
+  let { category, subcategory, confidence, reason, suggestedNewCategory, suggestedNewSubcategory, alternativeCategory } = obj;
+  if (typeof category === 'string' && catSet.has(category)) out.category = category;
+  if (typeof confidence === 'number') out.confidence = Math.max(0, Math.min(1, confidence));
+  if (typeof reason === 'string') out.reason = reason.slice(0, 280);
+  if (typeof suggestedNewCategory === 'string' && suggestedNewCategory.trim()) out.suggestedNewCategory = suggestedNewCategory.trim().split(/\s+/)[0];
+  if (typeof suggestedNewSubcategory === 'string' && suggestedNewSubcategory.trim()) out.suggestedNewSubcategory = suggestedNewSubcategory.trim().split(/\s+/)[0];
+  if (typeof alternativeCategory === 'string' && catSet.has(alternativeCategory) && alternativeCategory !== out.category) out.alternativeCategory = alternativeCategory;
+
+  // Subcategory validity
+  const subs = subcatsByCat?.[out.category];
+  if (Array.isArray(subs) && typeof subcategory === 'string' && subs.includes(subcategory) && out.confidence >= 0.8) {
+    out.subcategory = subcategory;
+  } else {
+    out.subcategory = null;
+  }
+  return out;
+}
+
+function splitLines(text) {
+  return String(text || '').split(/\r?\n/).map(s => s.trim()).filter(Boolean);
+}
+
+// Routes
+app.get('/health', (req, res) => res.json({ ok: true }));
+
+app.post('/classify', requireAppKey, async (req, res) => {
+  try {
+    const { text, categories, subcategoriesByCategory, hintsByCategory, languages } = req.body || {};
+    const raw = String(text || '');
+    const key = 'classify:' + normalizeKey(raw) + '|' + JSON.stringify(categories || []);
+    if (cache.has(key)) return res.json(cache.get(key));
+
+    const prompt = buildClassifyPrompt({ text: raw, categories, subcategoriesByCategory, hintsByCategory, languages });
+    const result = await callLLM({ prompt });
+    const clean = sanitizeSingle(result, categories, subcategoriesByCategory);
+    cache.set(key, clean);
+    return res.json(clean);
+  } catch (e) {
+    return res.status(500).json({ error: 'classification_failed' });
   }
 });
 
-// ---------- Start ----------
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log("proxy up on :" + PORT));
+app.post('/analyze', requireAppKey, async (req, res) => {
+  try {
+    const { text, categories, subcategoriesByCategory, hintsByCategory, languages } = req.body || {};
+    const lines = splitLines(text);
+    if (!lines.length) return res.json({ items: [] });
+
+    const key = 'analyze:' + normalizeKey(lines.join('|')) + '|' + JSON.stringify(categories || []);
+    if (cache.has(key)) return res.json(cache.get(key));
+
+    const prompt = buildAnalyzePrompt({ text: lines.join('\n'), categories, subcategoriesByCategory, hintsByCategory, languages });
+    const result = await callLLM({ prompt });
+    let items = Array.isArray(result?.items) ? result.items : [];
+    // sanitize each
+    items = lines.map((line, idx) => {
+      const r = items[idx] || {};
+      const clean = sanitizeSingle(r, categories, subcategoriesByCategory);
+      clean.text = line;
+      // /analyze schema doesn't include alternativeCategory
+      delete clean.alternativeCategory;
+      return clean;
+    });
+    const out = { items };
+    cache.set(key, out);
+    return res.json(out);
+  } catch (e) {
+    return res.status(500).json({ error: 'analyze_failed' });
+  }
+});
+
+app.listen(PORT, () => {
+  console.log(`secure-openai-proxy-stage1 listening on ${PORT}`);
+});

@@ -5,8 +5,8 @@ import helmet from 'helmet';
 import rateLimit from 'express-rate-limit';
 import { GoogleGenerativeAI } from '@google/generative-ai';
 import OpenAI from 'openai';
-import { buildClassifyPrompt, buildAnalyzePrompt } from './server/prompts_exact.js';
-import { mapClassify, mapAnalyze } from './server/mapper_strict.js';
+import { buildClassifyPrompt, buildAnalyzePrompt } from './prompts_exact.js';
+import { mapClassify, mapAnalyze } from './mapper_strict.js';
 
 const app = express();
 const PORT = process.env.PORT || 7845;

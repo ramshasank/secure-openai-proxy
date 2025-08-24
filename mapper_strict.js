@@ -1,5 +1,4 @@
-// server/mapper_strict.js
-// Strictly pass through model JSON. Do NOT fabricate suggestedNewCategory, etc.
+// mapper_strict.js (ESM)
 
 function tryParseJSON(s) {
   if (!s) return null;
@@ -9,7 +8,7 @@ function tryParseJSON(s) {
   return null;
 }
 
-function mapClassify(modelText) {
+export function mapClassify(modelText) {
   const parsed = tryParseJSON(modelText);
   if (!parsed || typeof parsed !== 'object') {
     return { provider:'model', category:'Other', subcategory:null, confidence:0.1, reason:'Fallback: unparseable model output', suggestedNewCategory:null, suggestedNewSubcategory:null, alternativeCategory:null, __raw:modelText };
@@ -27,7 +26,7 @@ function mapClassify(modelText) {
   };
 }
 
-function mapAnalyze(modelText, lines) {
+export function mapAnalyze(modelText, lines) {
   const parsed = tryParseJSON(modelText);
   if (!parsed || typeof parsed !== 'object' || !Array.isArray(parsed.items)) {
     return { provider:'model', items: lines.map(t => ({ text:t, category:'Other', subcategory:null, confidence:0.1, reason:'Fallback: unparseable model output', suggestedNewCategory:null, suggestedNewSubcategory:null })), __raw:modelText };
@@ -43,5 +42,3 @@ function mapAnalyze(modelText, lines) {
   }));
   return { provider:'model', items: out, __raw: modelText };
 }
-
-module.exports = { mapClassify, mapAnalyze };

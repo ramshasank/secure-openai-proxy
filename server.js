@@ -5,9 +5,177 @@ import helmet from 'helmet';
 import rateLimit from 'express-rate-limit';
 import { GoogleGenerativeAI } from '@google/generative-ai';
 import OpenAI from 'openai';
-import { buildClassifyPrompt, buildAnalyzePrompt } from './prompts_exact.js';
-import { mapClassify, mapAnalyze } from './mapper_strict.js';
 
+/* ---------- Inline: exact prompt builders ---------- */
+const pretty = (obj) => JSON.stringify(obj ?? {}, null, 2);
+
+function buildClassifyPrompt({ text, languages = [], categories = [], subcats = {}, hints = {} }) {
+  return `
+/classify
+
+You are a deterministic short-text classifier.     
+Return ONLY a single JSON object with this schema:    
+{     
+  "category": string,                     // must be one of CATEGORIES (case-insensitive match, but output must use provided casing)    
+  "subcategory": string|null,             // only choose from SUBCATEGORIES_BY_CATEGORY[category] if present AND highly confident; else null    
+  "confidence": number,                   // 0.0..1.0    
+  "reason": string,                       // one sentence, why you chose it    
+  "suggestedNewCategory": string|null,    // single word if a clearly better category is missing from CATEGORIES; else null    
+  "suggestedNewSubcategory": string|null, // single word if a clearly better subcategory is missing; else null    
+  "alternativeCategory": string|null      // optional: if text plausibly fits TWO categories, give the second best choice    
+}    
+
+CONTEXT:    
+- USER_PREFERRED_LANGUAGES: ${pretty(languages)}    
+- CATEGORIES: ${pretty(categories)}    
+- SUBCATEGORIES_BY_CATEGORY: ${pretty(subcats)}          // include only if user has subcategories    
+- HINTS_BY_CATEGORY: ${pretty(hints)}                    // optional user-learned phrases; can be empty    
+
+INTERPRETATION RULES (language-aware, dynamic)    
+1) Normalize spelling, transliteration, and synonyms across USER_PREFERRED_LANGUAGES before classifying.    
+2) If text contains QUANTITY markers ("x2","2kg","3 packs"), treat as a PHYSICAL ITEM:  
+   - Do NOT classify as "Movies" or "Shows" unless explicit media cues exist ("season","episode","trailer","movie","series","watch").  
+   - If it looks like an ingredient/consumable (cilantro, potato, onions) → category="Groceries".  
+   - If it looks like a prepared dish or cuisine item → category="Other", suggestedNewCategory="Food".  
+3) Reminders:  
+   - Choose "Reminders" if there is an explicit time/date expression (times, weekdays, relative dates),  
+     OR if the text contains explicit reminder phrasing such as "remind me", "set a reminder", "reminder to".  
+   - If there is reminder phrasing but no concrete time/date, still choose "Reminders" with moderate confidence.  
+4) Action verbs ("buy","get","renew","call","watch","pickup","order") bias towards "To-do"     
+   (unless a concrete time/date is present → "Reminders").    
+5) Media:    
+   - If the text is clearly a movie/film title → "Movies"    
+   - If clearly episodic/series → "Shows"    
+6) If both a task intent (verb) AND a media title are present (e.g. "watch Moana"):  
+   - category = "To-do"  
+   - alternativeCategory = "Movies" (or "Shows" if series)  
+   - reason should note both interpretations.  
+7) App/feature/bug/UX feedback or dev tasks (without explicit time) → "App"  
+8) If no confident match within CATEGORIES, use "Other" and set suggestedNewCategory to the best single word (e.g. "Food","Shopping","Cosmetics","Sports","Finance").  
+9) Only output a subcategory if it exists under the chosen category AND confidence ≥ 0.8.  
+
+CONSTRAINTS:    
+- "category" MUST be from CATEGORIES (use provided casing). If no fit, choose "Other".    
+- "alternativeCategory" MUST also be from CATEGORIES if present; else null.    
+- "subcategory" MUST be valid under the chosen category if used; else null.    
+- Output JSON only. No markdown or extra text.    
+
+TEXT TO CLASSIFY:
+${text ?? ''}
+`.trim();
+}
+
+function buildAnalyzePrompt({ lines, languages = [], categories = [], subcats = {}, hints = {} }) {
+  const joined = (lines ?? []).join("\n");
+  return `
+/analyze:
+
+You are a deterministic multi-line text classifier.    
+Return ONLY a single JSON object with this schema:  
+{  
+  "items": [  
+    {  
+      "text": string,  
+      "category": string,                 // must be one of CATEGORIES (case-insensitive match, but output must use provided casing)  
+      "subcategory": string|null,         // only choose from SUBCATEGORIES_BY_CATEGORY[category] if present AND highly confident; else null  
+      "confidence": number,               // 0.0..1.0  
+      "reason": string,                   // one sentence, why you chose it  
+      "suggestedNewCategory": string|null,   // single word if a clearly better category is missing from CATEGORIES; else null  
+      "suggestedNewSubcategory": string|null // single word if a clearly better subcategory is missing; else null  
+    }  
+  ]  
+}  
+
+CONTEXT:  
+- USER_PREFERRED_LANGUAGES: ${pretty(languages)}  
+- CATEGORIES: ${pretty(categories)}  
+- SUBCATEGORIES_BY_CATEGORY: ${pretty(subcats)}      // include only if user has subcategories  
+- HINTS_BY_CATEGORY: ${pretty(hints)}                // optional user-learned phrases; can be empty  
+
+INTERPRETATION RULES (language-aware, dynamic)  
+1) Normalize spelling, transliteration, and synonyms across USER_PREFERRED_LANGUAGES before classifying.  
+
+2) Quantities:  
+   - If text contains QUANTITY markers ("x2","2","2kg","3 packs"), treat as a PHYSICAL ITEM.  
+   - Do NOT classify as "Movies" or "Shows" unless explicit media cues exist ("season","episode","trailer","movie","series","watch").  
+   - If it looks like an ingredient/consumable (produce, staples) → category="Groceries".  
+   - If it looks like a prepared dish or cuisine item → category="Other", suggestedNewCategory="Food".  
+
+3) Reminders:  
+   - Choose "Reminders" if there is an explicit time/date expression (times, weekdays, relative dates like "tomorrow", "next week", "at 6pm", "on Monday").  
+   - OR if the text contains explicit reminder phrasing such as "remind me", "set a reminder", "reminder to".  
+   - If there is reminder phrasing but no concrete time/date, still choose "Reminders" with moderate confidence (0.6–0.75).  
+
+4) Action verbs ("buy","get","renew","call","watch","pickup","order") bias towards "To-do"  
+   (unless a concrete time/date or reminder phrasing is present → then "Reminders").  
+
+5) Media:  
+   - Movie/film titles → "Movies"  
+   - Episodic/series titles → "Shows"  
+   - If phrased as an action (e.g., "watch Moana trailer") it may also be "To-do"; choose the stronger intent.  
+
+6) App/feature/bug/UX feedback or development tasks (without explicit time) → "App".  
+
+7) If no confident match within CATEGORIES, use "Other" and set a single-word suggestedNewCategory that best fits    
+   (e.g., "Food","Shopping","Cosmetics","Sports","Finance").    
+   - Prefer "Food" for prepared dishes/cuisine.  
+   - Prefer "Shopping" for non-food tangible items if "Groceries" doesn’t apply.  
+
+CONSTRAINTS:  
+- Category MUST be from CATEGORIES (use provided casing). If no fit, choose "Other".  
+- Only output a subcategory if it already exists under the chosen category AND confidence ≥ 0.8; otherwise null.  
+- Output JSON only. No markdown or extra text.  
+
+TEXT TO CLASSIFY:
+${joined}
+`.trim();
+}
+
+/* ---------- Inline: strict mappers ---------- */
+function tryParseJSON(s) {
+  if (!s) return null;
+  try { return JSON.parse(s); } catch {}
+  const i = s.indexOf('{'); const j = s.lastIndexOf('}');
+  if (i >= 0 && j > i) { try { return JSON.parse(s.slice(i, j + 1)); } catch {} }
+  return null;
+}
+
+function mapClassify(modelText) {
+  const parsed = tryParseJSON(modelText);
+  if (!parsed || typeof parsed !== 'object') {
+    return { provider:'model', category:'Other', subcategory:null, confidence:0.1, reason:'Fallback: unparseable model output', suggestedNewCategory:null, suggestedNewSubcategory:null, alternativeCategory:null, __raw:modelText };
+  }
+  return {
+    provider:'model',
+    category: typeof parsed.category === 'string' ? parsed.category : 'Other',
+    subcategory: parsed.subcategory ?? null,
+    confidence: typeof parsed.confidence === 'number' ? parsed.confidence : 0.5,
+    reason: typeof parsed.reason === 'string' ? parsed.reason : '',
+    suggestedNewCategory: parsed.suggestedNewCategory ?? null,
+    suggestedNewSubcategory: parsed.suggestedNewSubcategory ?? null,
+    alternativeCategory: parsed.alternativeCategory ?? null,
+    __raw: modelText
+  };
+}
+
+function mapAnalyze(modelText, lines) {
+  const parsed = tryParseJSON(modelText);
+  if (!parsed || typeof parsed !== 'object' || !Array.isArray(parsed.items)) {
+    return { provider:'model', items: lines.map(t => ({ text:t, category:'Other', subcategory:null, confidence:0.1, reason:'Fallback: unparseable model output', suggestedNewCategory:null, suggestedNewSubcategory:null })), __raw:modelText };
+  }
+  const out = parsed.items.map((it, idx) => ({
+    text: lines[idx] ?? it.text ?? '',
+    category: typeof it.category === 'string' ? it.category : 'Other',
+    subcategory: it.subcategory ?? null,
+    confidence: typeof it.confidence === 'number' ? it.confidence : 0.5,
+    reason: typeof it.reason === 'string' ? it.reason : '',
+    suggestedNewCategory: it.suggestedNewCategory ?? null,
+    suggestedNewSubcategory: it.suggestedNewSubcategory ?? null
+  }));
+  return { provider:'model', items: out, __raw: modelText };
+}
+
+/* ---------- App ---------- */
 const app = express();
 const PORT = process.env.PORT || 7845;
 const APP_KEY = process.env.APP_KEY || '';
@@ -116,7 +284,22 @@ app.get('/health', (_req, res) => res.json({ ok: true }));
 
 app.post('/classify', requireAppKey, async (req, res) => {
   try {
-    const { text, categories, subcategoriesByCategory, hintsByCategory, languages } = req.body || {};
+    const body = req.body || {};
+    if (DEBUG_AI) console.log('[classify] body:', JSON.stringify(body).slice(0, 500));
+
+    const text = typeof body.text === 'string' ? body.text : String(body.text ?? '').trim();
+
+    let categories = Array.isArray(body.categories) && body.categories.length
+      ? body.categories
+      : ["To-do","Reminders","Groceries","Movies","Shows","App","Other"];
+
+    let languages = Array.isArray(body.languages) && body.languages.length
+      ? body.languages
+      : ["en","es","hi","zh","ko","it","vi","fr","te","ta","mr","bn","gu","pa","ur"];
+
+    const subcategoriesByCategory = body.subcategoriesByCategory || {};
+    const hintsByCategory = body.hintsByCategory || {};
+
     const prompt = buildClassifyPrompt({
       text,
       languages,
@@ -126,17 +309,17 @@ app.post('/classify', requireAppKey, async (req, res) => {
     });
 
     const { provider, raw, parsed } = await callLLM({ prompt });
-    const mapped = mapClassify(JSON.stringify(parsed)); // strict parse of model JSON
+    const mapped = mapClassify(JSON.stringify(parsed));
     mapped.provider = provider;
 
     const clean = sanitizeSingle(mapped, categories, subcategoriesByCategory);
 
-    // Optional debug echo (?debug=1)
     if (req.query.debug === '1') {
       clean.__debug = { prompt: trunc(prompt, 8000), raw: trunc(raw, 4000) };
     }
     if (DEBUG_AI) {
-      console.log('[classify] prompt:', trunc(prompt, 1200));
+      console.log('[classify] promptCtx cats:', categories);
+      console.log('[classify] promptCtx langs:', languages);
       console.log('[classify] mapped:', clean);
     }
     res.json(clean);
@@ -148,8 +331,22 @@ app.post('/classify', requireAppKey, async (req, res) => {
 
 app.post('/analyze', requireAppKey, async (req, res) => {
   try {
-    const { text, categories, subcategoriesByCategory, hintsByCategory, languages } = req.body || {};
-    const lines = splitLines(text);
+    const body = req.body || {};
+    if (DEBUG_AI) console.log('[analyze] body:', JSON.stringify(body).slice(0, 500));
+
+    const lines = splitLines(body.text);
+
+    let categories = Array.isArray(body.categories) && body.categories.length
+      ? body.categories
+      : ["To-do","Reminders","Groceries","Movies","Shows","App","Other"];
+
+    let languages = Array.isArray(body.languages) && body.languages.length
+      ? body.languages
+      : ["en","es","hi","zh","ko","it","vi","fr","te","ta","mr","bn","gu","pa","ur"];
+
+    const subcategoriesByCategory = body.subcategoriesByCategory || {};
+    const hintsByCategory = body.hintsByCategory || {};
+
     if (!lines.length) return res.json({ items: [] });
 
     const prompt = buildAnalyzePrompt({
@@ -162,16 +359,15 @@ app.post('/analyze', requireAppKey, async (req, res) => {
 
     const { provider, raw, parsed } = await callLLM({ prompt });
     const mapped = mapAnalyze(JSON.stringify(parsed), lines);
-    // batch schema intentionally omits alternativeCategory
-
-    const items = mapped.items.map(it => sanitizeSingle({ ...it, provider }, categories, subcategoriesByCategory));
+    const items = mapped.items.map(it =>
+      sanitizeSingle({ ...it, provider }, categories, subcategoriesByCategory)
+    );
 
     const payload = { items };
-    if (req.query.debug === '1') {
-      payload.__debug = { prompt: trunc(prompt, 8000), raw: trunc(raw, 4000) };
-    }
+    if (req.query.debug === '1') payload.__debug = { prompt: trunc(prompt, 8000), raw: trunc(raw, 4000) };
     if (DEBUG_AI) {
-      console.log('[analyze] prompt:', trunc(prompt, 1200));
+      console.log('[analyze] promptCtx cats:', categories);
+      console.log('[analyze] promptCtx langs:', languages);
       console.log('[analyze] items:', items.length);
     }
     res.json(payload);
@@ -181,4 +377,4 @@ app.post('/analyze', requireAppKey, async (req, res) => {
   }
 });
 
-app.listen(PORT, () => console.log(`smartnotes-proxy (exact prompts) on ${PORT}`));
+app.listen(PORT, () => console.log(`smartnotes-proxy (exact prompts, hardened) on ${PORT}`));

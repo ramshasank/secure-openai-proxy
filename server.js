@@ -249,58 +249,76 @@ async function callLLM({ prompt }) {
 }
 function sanitizeSingle(obj, categories, subcats) {
   const valid = new Set(Array.isArray(categories) ? categories : []);
+  const singleCategoryMode = Array.isArray(categories) && categories.length === 1; // ← key change
+
   const out = {
-    category: 'Other', subcategory: null, confidence: 0, reason: '',
-    suggestedNewCategory: null, suggestedNewSubcategory: null, alternativeCategory: null
+    category: 'Other',
+    subcategory: null,
+    confidence: 0,
+    reason: '',
+    suggestedNewCategory: null,
+    suggestedNewSubcategory: null,
+    alternativeCategory: null
   };
   if (!obj || typeof obj !== 'object') return out;
 
   const {
-    category, subcategory, confidence, reason,
-    suggestedNewCategory, suggestedNewSubcategory, alternativeCategory
+    category,
+    subcategory,
+    confidence,
+    reason,
+    suggestedNewCategory,
+    suggestedNewSubcategory,
+    alternativeCategory
   } = obj;
 
-  if (typeof category === 'string' && valid.has(category)) out.category = category;
-  if (typeof confidence === 'number') out.confidence = Math.max(0, Math.min(1, confidence));
-  if (typeof reason === 'string') out.reason = reason.slice(0, 280);
-  if (typeof suggestedNewCategory === 'string' && suggestedNewCategory.trim())
+  // Category
+  if (typeof category === 'string' && valid.has(category)) {
+    out.category = category;
+  }
+
+  // Confidence / reason
+  if (typeof confidence === 'number') {
+    out.confidence = Math.max(0, Math.min(1, confidence));
+  }
+  if (typeof reason === 'string') {
+    out.reason = reason.slice(0, 280);
+  }
+
+  // Suggestions
+  if (typeof suggestedNewCategory === 'string' && suggestedNewCategory.trim()) {
     out.suggestedNewCategory = suggestedNewCategory.trim().split(/\s+/)[0];
-  if (typeof suggestedNewSubcategory === 'string' && suggestedNewSubcategory.trim())
+  }
+  if (typeof suggestedNewSubcategory === 'string' && suggestedNewSubcategory.trim()) {
     out.suggestedNewSubcategory = suggestedNewSubcategory.trim().split(/\s+/)[0];
-  if (typeof alternativeCategory === 'string' && valid.has(alternativeCategory) && alternativeCategory !== out.category)
+  }
+
+  // Alternative (must be valid and different)
+  if (typeof alternativeCategory === 'string' &&
+      valid.has(alternativeCategory) &&
+      alternativeCategory !== out.category) {
     out.alternativeCategory = alternativeCategory;
+  }
 
-  // ---- Smarter subcategory acceptance (case-insensitive, suffix tolerant) ----
-  const list = subcats?.[out.category];
-  if (Array.isArray(list) && list.length > 0 && typeof subcategory === 'string' && subcategory.trim()) {
-    const want = subcategory.trim().toLowerCase();
-    // 1) exact (case-insensitive)
-    let match = list.find(s => s.toLowerCase() === want);
+  // Subcategory rules:
+  // - If SINGLE category request (locked category from ItemsView): accept any case-insensitive match
+  //   and normalize to canonical spelling (NO 0.8 threshold).
+  // - Else (multi-category batch): require ≥ 0.8 confidence (old behavior).
+  const subs = subcats?.[out.category];
+  if (Array.isArray(subs) && typeof subcategory === 'string' && subcategory.trim()) {
+    const proposedLC = subcategory.trim().toLowerCase();
 
-    // 2) tolerant match: "hindi" ↔ "hindi movies", "telugu" ↔ "telugu films"
-    if (!match) {
-      const norm = (s) => s.toLowerCase().replace(/\s+/g, ' ').trim();
-      const wantNorm = norm(want);
-      let best = null, bestScore = 0;
+    // Find canonical spelling by exact (case-insensitive) match, or a contained match
+    const canonical =
+      subs.find(s => s.toLowerCase() === proposedLC) ||
+      subs.find(s => s.toLowerCase().includes(proposedLC) || proposedLC.includes(s.toLowerCase()));
 
-      for (const cand of list) {
-        const c = norm(cand);
-        let score = 0;
-        if (c === wantNorm) score = 1.0;
-        else if (c.startsWith(wantNorm) || c.endsWith(wantNorm)) score = 0.95;   // "hindi movies", "movies hindi"
-        else if (wantNorm.startsWith(c) || wantNorm.endsWith(c)) score = 0.9;    // want="hindi movies", cand="hindi"
-        else if (c.includes(wantNorm) || wantNorm.includes(c)) score = 0.85;
-
-        if (score > bestScore) { best = cand; bestScore = score; }
+    if (canonical) {
+      if (singleCategoryMode) {
+        out.subcategory = canonical; // ← accept regardless of confidence
+      } else if (out.confidence >= 0.8) {
+        out.subcategory = canonical; // ← old rule kept for batch/global
       }
-
-      // accept a close match; keep your confidence gate if you want (here we use 0.85)
-      if (best && bestScore >= 0.85) match = best;
-    }
-
-    // Final guard: only set if model said confidence >= 0.8 (matches your prompt rule)
-    if (match && (out.confidence ?? 0) >= 0.8) {
-      out.subcategory = match;
     }
   }
 
